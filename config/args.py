@@ -153,9 +153,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     # mandatory arguments
     parser.add_argument('--env_type', type=str, choices=['atari', 'minigrid', 'gym', 'mujoco',
-                                                         'football', 'equation'])
+                                                         'football', 'equation', 'ev_truck'])
     parser.add_argument('--algo_type', type=str, choices=['ppo_nn', 'ppo_gbrl', 'a2c_gbrl', 'sac_gbrl',
-                                                          'awr_gbrl', 'dqn_gbrl', 'a2c_nn', 'awr_nn', 'dqn_nn'])
+                                                          'awr_gbrl', 'dqn_gbrl', 'a2c_nn', 'awr_nn', 'dqn_nn', 
+                                                          'ppo_xgb', 'awr_xgb', 'hybrid_gbrl', 'hybrid_xgb',
+                                                          'hybrid_rf'])
+
     parser.add_argument('--env_name', type=str)
     # env args
     parser.add_argument('--seed', type=int)
@@ -339,10 +342,13 @@ def parse_args():
 
 
 def get_defaults(args, defaults):
+    if args.algo_type not in defaults:
+        defaults[args.algo_type] = defaults.get('ppo_gbrl', {}).copy()
+
     # Set hardcoded defaults
     args.env_type = args.env_type if args.env_type else 'gym'
     args.algo_type = args.algo_type if args.algo_type else 'ppo_gbrl'
-    args.env_name = args.env_name if args.env_name else 'CartPole-v1'
+    args.env_name = args.env_name if args.env_name else 'Unknown'
     # Set defaults from YAML
     args.seed = args.seed if args.seed is not None else defaults['env']['seed']
     args.verbose = args.verbose if args.verbose is not None else defaults['env']['verbose']
@@ -990,6 +996,85 @@ def process_policy_kwargs(args):
             "seed": args.seed,
             "verbose": args.verbose,
         }
+
+    elif args.algo_type == 'awr_xgb':
+        defaults = load_yaml_defaults()
+        xgb_defaults = defaults.get('awr_xgb', {})
+        
+        yaml_actor = xgb_defaults.get('xgb_actor_params', {})
+        yaml_critic = xgb_defaults.get('xgb_critic_params', {})
+
+        algo_kwargs = {
+            "gamma": args.gamma,
+            "gae_lambda": args.gae_lambda,
+            "beta": args.beta,
+            "weights_max": args.weights_max,
+            "train_freq": args.train_freq,
+            "batch_size": args.batch_size,
+            "buffer_size": args.buffer_size,
+            "learning_starts": args.learning_starts,
+            "reward_mode": args.reward_mode,
+            "verbose": args.verbose,
+            "device": args.device,
+            "seed": args.seed,
+            "n_epochs": xgb_defaults.get('n_epochs', 50),
+            "policy_kwargs": args.policy_kwargs if args.policy_kwargs is not None else {
+                "xgb_actor_params": yaml_actor,
+                "xgb_critic_params": yaml_critic,
+            }
+        }
+
+    elif args.algo_type == 'ppo_xgb':
+        # Load the YAML file to get nested XGBoost parameters
+        defaults = load_yaml_defaults()
+        xgb_defaults = defaults.get('ppo_xgb', {})
+        
+        # Extract specific XGB params from YAML (or use safe empty dicts)
+        yaml_actor = xgb_defaults.get('xgb_actor_params', {})
+        yaml_critic = xgb_defaults.get('xgb_critic_params', {})
+
+        # Build the Actor Parameter Dict (with fallbacks)
+        default_actor_params = {
+            'max_depth': yaml_actor.get('max_depth', 3),
+            'learning_rate': yaml_actor.get('learning_rate', 0.1),
+            'n_estimators': yaml_actor.get('n_estimators', 100),
+            'nthread': yaml_actor.get('nthread', 1),
+            'min_child_weight': yaml_actor.get('min_child_weight', 0),
+            'reg_lambda': yaml_actor.get('reg_lambda', 1.0),
+            'subsample': yaml_actor.get('subsample', 1.0),
+        }
+
+        # Build the Critic Parameter Dict (with fallbacks)
+        default_critic_params = {
+            'max_depth': yaml_critic.get('max_depth', 3),
+            'learning_rate': yaml_critic.get('learning_rate', 0.1),
+            'n_estimators': yaml_critic.get('n_estimators', 100),
+            'nthread': yaml_critic.get('nthread', 1),
+            'min_child_weight': yaml_critic.get('min_child_weight', 0),
+            'reg_lambda': yaml_critic.get('reg_lambda', 1.0),
+            'subsample': yaml_critic.get('subsample', 1.0),
+        }
+        
+        # Assemble the final algorithm arguments
+        algo_kwargs = {
+            "learning_rate": args.learning_rate,
+            "n_steps": args.n_steps,
+            "batch_size": args.batch_size,
+            "n_epochs": args.n_epochs,
+            "gamma": args.gamma,
+            "gae_lambda": args.gae_lambda,
+            "clip_range": args.clip_range,
+            "ent_coef": args.ent_coef,
+            "vf_coef": args.vf_coef,
+            "verbose": args.verbose,
+            "device": args.device,
+            "seed": args.seed,
+            "policy_kwargs": args.policy_kwargs if args.policy_kwargs is not None else {
+                "xgb_actor_params": default_actor_params,
+                "xgb_critic_params": default_critic_params,
+            }
+        }
+
     if args.env_type in ['sepsis', 'symswap', 'openspiel']:
         if args.env_type == 'openspiel':
             algo_kwargs['rollouts_player'] = args.rollouts_player

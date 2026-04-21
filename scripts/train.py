@@ -42,13 +42,23 @@ from algos.awr_nn import AWR
 from algos.dqn import DQN_GBRL
 from algos.ppo import PPO_GBRL
 from algos.sac import SAC_GBRL
+
+from algos.ppo_xgb import PPO_XGB
+from algos.awr_xgb import AWR_XGB
+from algos.hybrid_gbrl import Hybrid_GBRL
+from algos.hybrid_xgb import Hybrid_XGB
+from algos.hybrid_rf import Hybrid_RF
+
 from config.args import parse_args, process_logging, process_policy_kwargs
 
 NAME_TO_ALGO = {'ppo_gbrl': PPO_GBRL, 'a2c_gbrl': A2C_GBRL, 'sac_gbrl': SAC_GBRL, 'awr_gbrl': AWR_GBRL,
-                'ppo_nn': PPO, 'a2c_nn': A2C, 'dqn_gbrl': DQN_GBRL, 'awr_nn': AWR, 'dqn_nn': DQN}
-CATEGORICAL_ALGOS = [algo for algo in NAME_TO_ALGO if 'gbrl' in algo]
-ON_POLICY_ALGOS = ['ppo_gbrl', 'a2c_gbrl']
-OFF_POLICY_ALGOS = ['sac_gbrl', 'dqn_gbrl', 'awr_gbrl']
+                'ppo_nn': PPO, 'a2c_nn': A2C, 'dqn_gbrl': DQN_GBRL, 'awr_nn': AWR, 'dqn_nn': DQN,
+                'ppo_xgb': PPO_XGB, 'awr_xgb': AWR_XGB, 'hybrid_gbrl': Hybrid_GBRL, 'hybrid_xgb': Hybrid_XGB,
+                'hybrid_rf': Hybrid_RF}
+
+CATEGORICAL_ALGOS = [algo for algo in NAME_TO_ALGO if 'gbrl' in algo or 'xgb' in algo]
+ON_POLICY_ALGOS = ['ppo_gbrl', 'a2c_gbrl', 'ppo_xgb']
+OFF_POLICY_ALGOS = ['sac_gbrl', 'dqn_gbrl', 'awr_gbrl', 'awr_xgb']
 
 if __name__ == '__main__':
     args = parse_args()
@@ -112,8 +122,19 @@ if __name__ == '__main__':
                            vec_env_cls=vec_env_cls)
         if args.evaluate:
             eval_env = make_vec_env(args.env_name, n_envs=1, env_kwargs=args.env_kwargs, vec_env_cls=vec_env_cls)
+    elif args.env_type == 'ev_truck':
+        from env.EVCorridorEnv import EVCorridorEnv
+        from stable_baselines3.common.vec_env import SubprocVecEnv
+        
+        env = make_vec_env(EVCorridorEnv, n_envs=args.num_envs, seed=args.seed, env_kwargs=args.env_kwargs, vec_env_cls=SubprocVecEnv)
+        
+        if args.evaluate:
+            # Eval env only needs 1 core (DummyVecEnv)
+            eval_env = make_vec_env(EVCorridorEnv, n_envs=1, env_kwargs=args.env_kwargs, vec_env_cls=DummyVecEnv)
+            
     else:
         print("Invalid env_type!")
+        
     if args.wrapper == 'normalize':
         args.wrapper_kwargs['gamma'] = args.gamma
         env = VecNormalize(env, **args.wrapper_kwargs)
@@ -164,12 +185,23 @@ if __name__ == '__main__':
     set_seed(args.seed)
 
     algo_kwargs = process_policy_kwargs(args)
+    
+    # --- NEW: Bridge the native flags to your custom Hybrid_XGB parameters ---
+    if args.algo_type == 'hybrid_xgb':
+        if args.learning_rate is not None: algo_kwargs['ppo_lr'] = args.learning_rate
+        if args.beta is not None:          algo_kwargs['awr_beta'] = args.beta
+        if args.max_depth is not None:     algo_kwargs['max_depth'] = args.max_depth
+    # -------------------------------------------------------------------------
+
     print(f"Training with algo_kwargs: {algo_kwargs}")
 
     algo = NAME_TO_ALGO[args.algo_type](env=env, tensorboard_log=tensorboard_log, _init_setup_model=True, **algo_kwargs)
 
+    # --- NEW: Force Tensorboard to use your Sweep Run Name ---
+    tb_name = args.run_name if args.run_name else args.algo_type.upper()
+
     algo.learn(total_timesteps=args.total_n_steps, callback=callback, log_interval=args.log_interval,
-               progress_bar=False, **learn_kwargs)
+               progress_bar=False, tb_log_name=args.algo_type, **learn_kwargs)
 
     if args.save_every > 0:
         print("End of training save")

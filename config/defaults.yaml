@@ -286,3 +286,62 @@ distillation:
     lr: 1.0
     capacity: 20000
 
+ppo_xgb:
+  wrapper_kwargs:
+    training: True
+    norm_obs: False
+    norm_reward: True
+  atari_wrapper_kwargs:
+    clip_reward: True
+  n_steps: 1024
+  batch_size: 1024
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.0
+  vf_coef: 0.5
+  xgb_actor_params:
+    max_depth: 3
+    learning_rate: 0.1
+    n_estimators: 100
+    nthread: 1
+    min_child_weight: 0
+    reg_lambda: 1.0
+    subsample: 0.8
+  xgb_critic_params:
+    max_depth: 3
+    learning_rate: 0.1
+    n_estimators: 100
+    nthread: 1
+    min_child_weight: 0
+    reg_lambda: 1.0
+    subsample: 0.8
+
+awr_xgb:
+  wrapper_kwargs:
+    training: True
+    norm_obs: False
+    norm_reward: True
+  atari_wrapper_kwargs:
+    clip_reward: True
+  train_freq: 2048
+  batch_size: 2048
+  n_epochs: 50 
+  gamma: 0.99
+  gae_lambda: 0.95
+  beta: 0.05
+  weights_max: 20.0
+  buffer_size: 100000
+  learning_starts: 2048
+  reward_mode: gae
+  xgb_actor_params:
+    max_depth: 4
+    learning_rate: 0.1
+    nthread: 1
+    subsample: 0.8
+  xgb_critic_params:
+    max_depth: 4
+    learning_rate: 0.1
+    nthread: 1
+    subsample: 0.8
