@@ -188,20 +188,21 @@ if __name__ == '__main__':
     
     # --- NEW: Bridge the native flags to your custom Hybrid_XGB parameters ---
     if args.algo_type == 'hybrid_xgb':
-        if args.learning_rate is not None: algo_kwargs['ppo_lr'] = args.learning_rate
-        if args.beta is not None:          algo_kwargs['awr_beta'] = args.beta
+        if args.ppo_lr is not None: algo_kwargs['ppo_lr'] = args.ppo_lr
+        if args.awr_beta is not None:          algo_kwargs['awr_beta'] = args.awr_beta
         if args.max_depth is not None:     algo_kwargs['max_depth'] = args.max_depth
+        if args.use_ppo_clip is not None:          algo_kwargs['use_ppo_clip'] = args.use_ppo_clip
+        if args.obs_dependent_std is not None:     algo_kwargs['obs_dependent_std'] = args.obs_dependent_std
     # -------------------------------------------------------------------------
 
     print(f"Training with algo_kwargs: {algo_kwargs}")
 
     algo = NAME_TO_ALGO[args.algo_type](env=env, tensorboard_log=tensorboard_log, _init_setup_model=True, **algo_kwargs)
 
-    # --- NEW: Force Tensorboard to use your Sweep Run Name ---
-    tb_name = args.run_name if args.run_name else args.algo_type.upper()
-
+    tb_name = args.algo_type + '_ppo_lr_' + str(args.ppo_lr) + '_awr_beta_' + str(args.awr_beta) + '_use_ppo_clip_' + str(args.use_ppo_clip) + '_obs_dependent_std_' + str(args.obs_dependent_std)
+    
     algo.learn(total_timesteps=args.total_n_steps, callback=callback, log_interval=args.log_interval,
-               progress_bar=False, tb_log_name=args.algo_type, **learn_kwargs)
+               progress_bar=False, tb_log_name=tb_name, **learn_kwargs)
 
     if args.save_every > 0:
         print("End of training save")

@@ -43,14 +43,28 @@ class XGBoostTreeEngine:
     """
  
     def __init__(self, action_dim, max_depth, n_estimators, ppo_lr, awr_beta,
-                 action_low, action_high, clip_ratio=0.2):
-        self.action_dim      = action_dim
-        self.n_estimators    = n_estimators
-        self.ppo_lr          = ppo_lr
-        self.awr_beta        = awr_beta
-        self.clip_ratio      = clip_ratio
-        self.action_low      = action_low
-        self.action_high     = action_high
+                 action_low, action_high, clip_ratio=0.2,
+                 use_ppo_clip=False, obs_dependent_std=True):
+        self.action_dim          = action_dim
+        self.n_estimators        = n_estimators
+        self.ppo_lr              = ppo_lr
+        self.awr_beta            = awr_beta
+        self.clip_ratio          = clip_ratio
+        self.action_low          = action_low
+        self.action_high         = action_high
+        # ---- Algorithm variant flags ----
+        # use_ppo_clip     : True  → PPO clipped surrogate (masks samples where
+        #                            the policy has already moved too far)
+        #                    False → plain A2C (raw policy gradient, no ratio)
+        # obs_dependent_std: True  → per-leaf aleatoric variance (different
+        #                            exploration width per state region)
+        #                    False → single global log_std vector shared across
+        #                            all observations
+        self.use_ppo_clip        = use_ppo_clip
+        self.obs_dependent_std   = obs_dependent_std
+        if not obs_dependent_std:
+            # Global log-std, one value per action dimension
+            self.log_std = np.zeros(action_dim, dtype=np.float32)
  
         self.actor_model  = None
         self.critic_model = None
@@ -125,21 +139,23 @@ class XGBoostTreeEngine:
  
         means   = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
         native  = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
-        # Aleatoric variance per (tree, leaf): var(residuals in leaf) * lr^2.
-        # Summed across trees in pick_action to give a per-dim, per-observation
-        # exploration width — more expressive than a single global log_std.
-        vars_   = np.full((total_trees, max_lid + 1), 1e-4, dtype=np.float32)
+        if self.obs_dependent_std:
+            # Aleatoric variance per (tree, leaf): var(residuals) * lr^2.
+            # Summed across trees to give per-observation exploration width.
+            vars_ = np.full((total_trees, max_lid + 1), 1e-4, dtype=np.float32)
  
         for i, tree_dict in enumerate(self.actor_leaves_per_tree):
             for lid, ldata in tree_dict.items():
                 means[i, lid]  = ldata.get('leaf_mean',
                                  ldata.get('leaf_weight', 0.0))
                 native[i, lid] = ldata.get('leaf', 0.0)
-                vars_[i, lid]  = max(ldata.get('leaf_variance', 1e-4), 1e-4)
+                if self.obs_dependent_std:
+                    vars_[i, lid] = max(ldata.get('leaf_variance', 1e-4), 1e-4)
  
         self.fast_leaf_means_arr     = means
         self.native_leaf_weights_arr = native
-        self.fast_leaf_vars_arr      = vars_
+        if self.obs_dependent_std:
+            self.fast_leaf_vars_arr = vars_
  
         # Per-tree update weights: inversely proportional to each tree's mean
         # absolute leaf value.  Early boosting rounds fit the full signal and
@@ -313,42 +329,77 @@ class XGBoostTreeEngine:
         mu = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)  # (N, D)
         mu += self.actor_params['base_score']
  
-        # ---- 3. Gather per-leaf variances and compute gradients ----
-        gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]  # (N, T)
-        var_sum = np.clip(
-            gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
-            1e-4, 5.0,
-        )                                                                     # (N, D)
+        # ---- 3. Get variance (per-leaf or global) ----
+        if self.obs_dependent_std:
+            gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]
+            var_sum = np.clip(
+                gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
+                1e-4, 5.0,
+            )                                                                 # (N, D)
+        else:
+            var_sum = np.broadcast_to(
+                np.exp(self.log_std) ** 2, (N, self.action_dim)
+            ).copy()                                                           # (N, D)
  
-        # Mean gradient: advantage * (action - mu) / var  [chain rule, additive ensemble]
-        raw_grad_mu = advantages * (actions_flat - mu) / var_sum
+        # ---- 4. Effective advantages (PPO clip or raw A2C) ----
+        if self.use_ppo_clip:
+            # Recompute log π_new under the current (just-updated) policy.
+            new_log_prob = (
+                -0.5 * (((actions_flat - mu) ** 2) / var_sum
+                        + np.log(var_sum)
+                        + np.log(2 * np.pi))
+            ).sum(axis=1)                                                     # (N,)
+            ratio = np.exp(new_log_prob - old_log_probs)                      # (N,)
+            # Zero out samples where the policy has already moved outside
+            # [1-ε, 1+ε] in the direction that would push it further out.
+            # This is the exact PPO masking condition.
+            adv_flat = advantages.flatten()
+            clip_mask = ~(
+                ((ratio > 1.0 + self.clip_ratio) & (adv_flat > 0)) |
+                ((ratio < 1.0 - self.clip_ratio) & (adv_flat < 0))
+            )                                                                 # (N,)
+            eff_adv = advantages * clip_mask.reshape(-1, 1)                  # (N, D)
+        else:
+            # A2C: use raw (normalised) advantages, no ratio gating
+            eff_adv = advantages                                              # (N, D)
+ 
+        # ---- 5. Compute gradients ----
+        # Mean: ∂log π/∂μ = advantage * (action - μ) / var
+        raw_grad_mu = eff_adv * (actions_flat - mu) / var_sum
         grad_mu     = np.clip(raw_grad_mu, -10.0, 10.0)
         step_mu     = self.ppo_lr * grad_mu                                   # (N, D)
  
-        # Variance gradient: ∂log π/∂var = 0.5 * advantage * ((a-mu)²/var² - 1/var)
-        # Each tree's var contributes additively to var_sum, so ∂var_sum/∂var_t = 1
-        # and the chain rule gives the same expression for every contributing tree.
-        grad_var  = 0.5 * advantages * (
+        # Variance: ∂log π/∂var = 0.5 * advantage * ((a-μ)²/var² - 1/var)
+        grad_var = 0.5 * eff_adv * (
             (actions_flat - mu) ** 2 / var_sum ** 2 - 1.0 / var_sum
         )
-        step_var  = self.ppo_lr * grad_var                                    # (N, D)
+        step_var = self.ppo_lr * grad_var                                     # (N, D)
  
-        # ---- 4. Scatter mean and variance updates via per-tree bincount ----
-        step_mu_per_tree  = step_mu[:, self._dim_indices]  * self._tree_weights[np.newaxis, :]
-        step_var_per_tree = step_var[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
+        # ---- 6. Scatter mean updates via per-tree bincount ----
+        step_mu_per_tree = step_mu[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
  
         max_lid_p1 = self._max_leaf_id + 1
         for t in range(T):
             lids = leaf_assignments[:, t]
             mean_update = np.bincount(lids, weights=step_mu_per_tree[:, t],
                                       minlength=max_lid_p1).astype(np.float32)
-            var_update  = np.bincount(lids, weights=step_var_per_tree[:, t],
-                                      minlength=max_lid_p1).astype(np.float32)
             self.fast_leaf_means_arr[t] += mean_update[:max_lid_p1]
-            self.fast_leaf_vars_arr[t]  += var_update[:max_lid_p1]
  
-        # Enforce aleatoric variance floor — prevents the distribution collapsing
-        np.maximum(self.fast_leaf_vars_arr, 1e-4, out=self.fast_leaf_vars_arr)
+        # ---- 7. Variance update (per-leaf or global) ----
+        if self.obs_dependent_std:
+            step_var_per_tree = step_var[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
+            for t in range(T):
+                lids = leaf_assignments[:, t]
+                var_update = np.bincount(lids, weights=step_var_per_tree[:, t],
+                                         minlength=max_lid_p1).astype(np.float32)
+                self.fast_leaf_vars_arr[t] += var_update[:max_lid_p1]
+            np.maximum(self.fast_leaf_vars_arr, 1e-4, out=self.fast_leaf_vars_arr)
+        else:
+            # Single global log_std update: average gradient across batch
+            grad_log_std      = eff_adv * (((actions_flat - mu) ** 2) / var_sum - 1.0)
+            mean_grad_log_std = np.clip(grad_log_std.mean(axis=0), -0.5, 0.5)
+            self.log_std     += self.ppo_lr * mean_grad_log_std
+            self.log_std      = np.maximum(self.log_std, -2.0)
  
     # ------------------------------------------------------------------
     # Inference — fully vectorized
@@ -375,15 +426,19 @@ class XGBoostTreeEngine:
         mu       = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)
         mu      += self.actor_params['base_score']       # (N, D)
  
-        # Sum per-tree aleatoric variances for each action dimension.
-        # Each tree handles one dim (dim_indices[t] = t % action_dim), so
-        # reshaping (N, T) → (N, n_estimators, action_dim) and summing axis 1
-        # correctly accumulates variance across boosting rounds per dimension.
-        gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]  # (N, T)
-        var = np.clip(
-            gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
-            1e-4, 5.0,
-        )                                                # (N, D)
+        if self.obs_dependent_std:
+            # Sum per-tree aleatoric variances → different exploration width
+            # per observation region.
+            gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]
+            var = np.clip(
+                gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
+                1e-4, 5.0,
+            )                                            # (N, D)
+        else:
+            # Single global variance shared across all observations.
+            var = np.broadcast_to(
+                np.exp(self.log_std) ** 2, (N, self.action_dim)
+            ).copy()
         std = np.sqrt(var)
  
         raw_actions = np.random.normal(loc=mu, scale=std)
@@ -411,7 +466,8 @@ class Hybrid_XGB:
  
     def __init__(self, env, awr_update_freq=10000, awr_buffer_size=15000,
                  n_steps=256, gamma=0.99, gae_lambda=0.95, ppo_lr=0.01,
-                 awr_beta=0.05, max_depth=6, n_estimators=500, **kwargs):
+                 awr_beta=0.05, max_depth=6, n_estimators=500,
+                 use_ppo_clip=False, obs_dependent_std=True, **kwargs):
         self.env      = env
         self.n_envs   = env.num_envs
         self.n_steps  = n_steps
@@ -438,6 +494,8 @@ class Hybrid_XGB:
         self.engine = XGBoostTreeEngine(
             self.action_dim, max_depth, n_estimators, ppo_lr, awr_beta,
             self.action_low, self.action_high,
+            use_ppo_clip=use_ppo_clip,
+            obs_dependent_std=obs_dependent_std,
         )
  
         self.rollout_buffer = RolloutBuffer(
@@ -506,7 +564,7 @@ class Hybrid_XGB:
         iteration      = 0
         start_time     = time.time()
  
-        print("🚀 Starting Hybrid XGBoost Training Loop...")
+        print("Starting Hybrid XGBoost Training Loop...")
  
         while self.num_timesteps < total_timesteps:
             self.rollout_buffer.reset()
@@ -564,7 +622,7 @@ class Hybrid_XGB:
                     cap = self.awr_buffer['max_size']
                     ptr = self.awr_buffer['ptr']
                     idx = np.arange(ptr - valid_size, ptr) % cap
-                    print(f"🌲 [Timestep {self.num_timesteps}] "
+                    print(f"[Timestep {self.num_timesteps}] "
                           f"Triggering AWR Macro-Update ({valid_size} samples)...")
                     self.engine.train_macro_awr(
                         self.awr_buffer['obs'][idx],

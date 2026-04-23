@@ -305,6 +305,13 @@ def parse_args():
     parser.add_argument('--generator_type', type=str, choices=['Quantile', 'quantile', 'l2', 'Uniform', 'uniform'])
     parser.add_argument('--grow_policy', type=str, choices=['Oblivious', 'Greedy', 'greedy', 'oblivious'])
     parser.add_argument('--feature_weights', type=json_string_to_list)
+
+    #HYBRID_XGB params
+    parser.add_argument('--ppo_lr', type=float)
+    parser.add_argument('--awr_beta', type=float)
+    parser.add_argument('--use_ppo_clip', action='store_true')
+    parser.add_argument('--obs_dependent_std', action='store_true')
+
     # Saving params
     parser.add_argument('--save_name', type=str)
     parser.add_argument('--save_path', type=str)
