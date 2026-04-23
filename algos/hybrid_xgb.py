@@ -84,8 +84,6 @@ class XGBoostTreeEngine:
         self.actor_lr  = self.actor_params['eta']
         self.critic_lr = self.critic_params['eta']
  
-        # Global trainable log-std for Gaussian exploration
-        self.log_std = np.zeros(self.action_dim, dtype=np.float32)
  
     # ------------------------------------------------------------------
     # Internal helpers
@@ -127,15 +125,39 @@ class XGBoostTreeEngine:
  
         means   = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
         native  = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
+        # Aleatoric variance per (tree, leaf): var(residuals in leaf) * lr^2.
+        # Summed across trees in pick_action to give a per-dim, per-observation
+        # exploration width — more expressive than a single global log_std.
+        vars_   = np.full((total_trees, max_lid + 1), 1e-4, dtype=np.float32)
  
         for i, tree_dict in enumerate(self.actor_leaves_per_tree):
             for lid, ldata in tree_dict.items():
                 means[i, lid]  = ldata.get('leaf_mean',
                                  ldata.get('leaf_weight', 0.0))
                 native[i, lid] = ldata.get('leaf', 0.0)
+                vars_[i, lid]  = max(ldata.get('leaf_variance', 1e-4), 1e-4)
  
-        self.fast_leaf_means_arr    = means
+        self.fast_leaf_means_arr     = means
         self.native_leaf_weights_arr = native
+        self.fast_leaf_vars_arr      = vars_
+ 
+        # Per-tree update weights: inversely proportional to each tree's mean
+        # absolute leaf value.  Early boosting rounds fit the full signal and
+        # tend to have large leaf values; later rounds fit small residuals and
+        # have small leaf values.  Normalizing by magnitude puts all trees on
+        # the same scale before applying the gradient.
+        # Weights are normalized to sum to 1 so the total update magnitude
+        # across the ensemble equals ppo_lr * grad_mu — same as before.
+        mean_abs = np.zeros(total_trees, dtype=np.float32)
+        for i, tree_dict in enumerate(self.actor_leaves_per_tree):
+            vals = np.array([
+                ldata.get('leaf_mean', ldata.get('leaf_weight', 0.0))
+                for ldata in tree_dict.values()
+            ], dtype=np.float32)
+            mean_abs[i] = np.mean(np.abs(vals)) if len(vals) > 0 else 0.0
+ 
+        raw_w = 1.0 / (mean_abs + 1e-8)
+        self._tree_weights = (raw_w / raw_w.sum()).astype(np.float32)  # (total_trees,)
  
     # ------------------------------------------------------------------
     # Macro update  (AWR)
@@ -291,35 +313,42 @@ class XGBoostTreeEngine:
         mu = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)  # (N, D)
         mu += self.actor_params['base_score']
  
-        # ---- 3. Gradients (global log_std variance) ----
-        var_sum = np.exp(self.log_std) ** 2              # (D,)
+        # ---- 3. Gather per-leaf variances and compute gradients ----
+        gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]  # (N, T)
+        var_sum = np.clip(
+            gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
+            1e-4, 5.0,
+        )                                                                     # (N, D)
  
+        # Mean gradient: advantage * (action - mu) / var  [chain rule, additive ensemble]
         raw_grad_mu = advantages * (actions_flat - mu) / var_sum
         grad_mu     = np.clip(raw_grad_mu, -10.0, 10.0)
-        step_mu     = (self.ppo_lr * grad_mu) / self.n_estimators  # (N, D)
+        step_mu     = self.ppo_lr * grad_mu                                   # (N, D)
  
-        # ---- 4. Scatter updates: per-tree bincount (fast C-level, no Python scatter) ----
-        # step_per_tree[n, t] = step_mu[n, dim_indices[t]]  — the gradient step
-        # for sample n attributed to tree t (which handles dim_indices[t]).
-        step_per_tree = step_mu[:, self._dim_indices]    # (N, T)  — no loop
+        # Variance gradient: ∂log π/∂var = 0.5 * advantage * ((a-mu)²/var² - 1/var)
+        # Each tree's var contributes additively to var_sum, so ∂var_sum/∂var_t = 1
+        # and the chain rule gives the same expression for every contributing tree.
+        grad_var  = 0.5 * advantages * (
+            (actions_flat - mu) ** 2 / var_sum ** 2 - 1.0 / var_sum
+        )
+        step_var  = self.ppo_lr * grad_var                                    # (N, D)
  
-        # np.add.at on a (N*T,) flat index is slow because it serialises every
-        # element.  np.bincount with weights sums all samples landing in the same
-        # leaf of a given tree in one C call, which is orders of magnitude faster.
+        # ---- 4. Scatter mean and variance updates via per-tree bincount ----
+        step_mu_per_tree  = step_mu[:, self._dim_indices]  * self._tree_weights[np.newaxis, :]
+        step_var_per_tree = step_var[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
+ 
         max_lid_p1 = self._max_leaf_id + 1
         for t in range(T):
-            update = np.bincount(
-                leaf_assignments[:, t],
-                weights=step_per_tree[:, t],
-                minlength=max_lid_p1,
-            ).astype(np.float32)
-            self.fast_leaf_means_arr[t] += update[:max_lid_p1]
+            lids = leaf_assignments[:, t]
+            mean_update = np.bincount(lids, weights=step_mu_per_tree[:, t],
+                                      minlength=max_lid_p1).astype(np.float32)
+            var_update  = np.bincount(lids, weights=step_var_per_tree[:, t],
+                                      minlength=max_lid_p1).astype(np.float32)
+            self.fast_leaf_means_arr[t] += mean_update[:max_lid_p1]
+            self.fast_leaf_vars_arr[t]  += var_update[:max_lid_p1]
  
-        # ---- 5. Global log_std update ----
-        grad_log_std      = advantages * (((actions_flat - mu) ** 2) / var_sum - 1.0)
-        mean_grad_log_std = np.clip(grad_log_std.mean(axis=0), -0.5, 0.5)
-        self.log_std     += self.ppo_lr * mean_grad_log_std
-        self.log_std      = np.maximum(self.log_std, -2.0)
+        # Enforce aleatoric variance floor — prevents the distribution collapsing
+        np.maximum(self.fast_leaf_vars_arr, 1e-4, out=self.fast_leaf_vars_arr)
  
     # ------------------------------------------------------------------
     # Inference — fully vectorized
@@ -346,8 +375,16 @@ class XGBoostTreeEngine:
         mu       = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)
         mu      += self.actor_params['base_score']       # (N, D)
  
-        std      = np.exp(self.log_std)                  # (D,)
-        var      = std ** 2
+        # Sum per-tree aleatoric variances for each action dimension.
+        # Each tree handles one dim (dim_indices[t] = t % action_dim), so
+        # reshaping (N, T) → (N, n_estimators, action_dim) and summing axis 1
+        # correctly accumulates variance across boosting rounds per dimension.
+        gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]  # (N, T)
+        var = np.clip(
+            gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
+            1e-4, 5.0,
+        )                                                # (N, D)
+        std = np.sqrt(var)
  
         raw_actions = np.random.normal(loc=mu, scale=std)
         log_probs   = (
@@ -517,13 +554,23 @@ class Hybrid_XGB:
             if (self.num_timesteps % self.awr_update_freq) < (self.n_envs * self.n_steps):
                 valid_size = self.awr_buffer['size']
                 if valid_size > 500:
+                    # Read all valid samples in insertion order using ring-buffer
+                    # index arithmetic. Once the buffer is full ptr wraps around,
+                    # so a plain [:valid_size] slice would silently return samples
+                    # in array order rather than recency order.
+                    # arange(ptr - n, ptr) % cap always yields the correct slots:
+                    # before wrap-around this is identical to [:valid_size];
+                    # after wrap-around it correctly spans the seam.
+                    cap = self.awr_buffer['max_size']
+                    ptr = self.awr_buffer['ptr']
+                    idx = np.arange(ptr - valid_size, ptr) % cap
                     print(f"🌲 [Timestep {self.num_timesteps}] "
-                          f"Triggering AWR Macro-Update...")
+                          f"Triggering AWR Macro-Update ({valid_size} samples)...")
                     self.engine.train_macro_awr(
-                        self.awr_buffer['obs'][:valid_size],
-                        self.awr_buffer['actions'][:valid_size],
-                        self.awr_buffer['advantages'][:valid_size],
-                        self.awr_buffer['returns'][:valid_size],
+                        self.awr_buffer['obs'][idx],
+                        self.awr_buffer['actions'][idx],
+                        self.awr_buffer['advantages'][idx],
+                        self.awr_buffer['returns'][idx],
                     )
  
             # --- 4. LOGGING ---
