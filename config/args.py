@@ -311,6 +311,9 @@ def parse_args():
     parser.add_argument('--awr_beta', type=float)
     parser.add_argument('--use_ppo_clip', action='store_true')
     parser.add_argument('--obs_dependent_std', action='store_true')
+    parser.add_argument('--awr_update_freq', type=int)
+    parser.add_argument('--awr_buffer_size', type=int)
+    parser.add_argument('--n_estimators', type=int)
 
     # Saving params
     parser.add_argument('--save_name', type=str)
@@ -565,6 +568,12 @@ def get_defaults(args, defaults):
     args.distil_kwargs = args.distil_kwargs if args.distil_kwargs is not None else \
         defaults['distillation']['distil_kwargs']
     # Distillation/Compression Params
+
+    # Hybrid XGB params
+    args.n_estimators = args.n_estimators if args.n_estimators is not None else 500
+    args.awr_update_freq = args.awr_update_freq if args.awr_update_freq is not None else 10000
+    args.awr_buffer_size = args.awr_buffer_size if args.awr_buffer_size is not None else 15000    
+
     return args
 
 
@@ -1061,25 +1070,39 @@ def process_policy_kwargs(args):
             'reg_lambda': yaml_critic.get('reg_lambda', 1.0),
             'subsample': yaml_critic.get('subsample', 1.0),
         }
+
+    elif args.algo_type == 'hybrid_xgb':
+
+        default_actor_params = {
+            'objective': 'reg:squarederror',
+            'max_depth': args.max_depth,
+            'tree_method': 'hist',
+            'base_score': 0,
+            'eta': args.learning_rate  # Using the bridged PPO LR
+        }
         
-        # Assemble the final algorithm arguments
+        default_critic_params = {
+            'objective': 'reg:squarederror',
+            'max_depth': args.max_depth,
+            'tree_method': 'hist',
+            'base_score': 0,
+            'eta': args.learning_rate
+        }
+
         algo_kwargs = {
+            "n_estimators": args.n_estimators if hasattr(args, 'n_estimators') and args.n_estimators else 500,
+            "awr_update_freq": args.awr_update_freq if hasattr(args, 'awr_update_freq') else 10000,
+            "awr_buffer_size": args.awr_buffer_size if hasattr(args, 'awr_buffer_size') else 15000,
             "learning_rate": args.learning_rate,
+            "beta": args.beta,
             "n_steps": args.n_steps,
-            "batch_size": args.batch_size,
-            "n_epochs": args.n_epochs,
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,
-            "clip_range": args.clip_range,
-            "ent_coef": args.ent_coef,
-            "vf_coef": args.vf_coef,
-            "verbose": args.verbose,
+            "actor_params": default_actor_params,  # 🟢 Variable is now defined
+            "critic_params": default_critic_params,
             "device": args.device,
             "seed": args.seed,
-            "policy_kwargs": args.policy_kwargs if args.policy_kwargs is not None else {
-                "xgb_actor_params": default_actor_params,
-                "xgb_critic_params": default_critic_params,
-            }
+            "verbose": args.verbose,
         }
 
     if args.env_type in ['sepsis', 'symswap', 'openspiel']:
