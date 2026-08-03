@@ -24,6 +24,7 @@ from stable_baselines3.common.vec_env import (DummyVecEnv, VecFrameStack,
 from callback.callbacks import (OffPolicyDistillationCallback,
                                 OnPolicyDistillationCallback,
                                 StopTrainingOnNoImprovementInTraining)
+
 from env.equation import register_equation_tests
 from env.minigrid import register_minigrid_tests
 from env.wrappers import (CategoricalDummyVecEnv,
@@ -122,14 +123,16 @@ if __name__ == '__main__':
                            vec_env_cls=vec_env_cls)
         if args.evaluate:
             eval_env = make_vec_env(args.env_name, n_envs=1, env_kwargs=args.env_kwargs, vec_env_cls=vec_env_cls)
+            
     elif args.env_type == 'ev_truck':
         from env.EVCorridorEnv import EVCorridorEnv
-        from stable_baselines3.common.vec_env import SubprocVecEnv
+        # 🟢 THE FIX: Import DummyVecEnv instead of SubprocVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv
         
-        env = make_vec_env(EVCorridorEnv, n_envs=args.num_envs, seed=args.seed, env_kwargs=args.env_kwargs, vec_env_cls=SubprocVecEnv)
+        # 🟢 THE FIX: Pass DummyVecEnv to vec_env_cls
+        env = make_vec_env(EVCorridorEnv, n_envs=args.num_envs, seed=args.seed, env_kwargs=args.env_kwargs, vec_env_cls=DummyVecEnv)
         
         if args.evaluate:
-            # Eval env only needs 1 core (DummyVecEnv)
             eval_env = make_vec_env(EVCorridorEnv, n_envs=1, env_kwargs=args.env_kwargs, vec_env_cls=DummyVecEnv)
             
     else:
@@ -186,14 +189,15 @@ if __name__ == '__main__':
 
     algo_kwargs = process_policy_kwargs(args)
     
-    # --- NEW: Bridge the native flags to your custom Hybrid_XGB parameters ---
-    if args.algo_type == 'hybrid_xgb':
-        if args.ppo_lr is not None: algo_kwargs['ppo_lr'] = args.ppo_lr
-        if args.awr_beta is not None:          algo_kwargs['awr_beta'] = args.awr_beta
-        if args.max_depth is not None:     algo_kwargs['max_depth'] = args.max_depth
-        if args.use_ppo_clip is not None:          algo_kwargs['use_ppo_clip'] = args.use_ppo_clip
-        if args.obs_dependent_std is not None:     algo_kwargs['obs_dependent_std'] = args.obs_dependent_std
-    # -------------------------------------------------------------------------
+    # # --- NEW: Bridge the native flags to your custom Hybrid_XGB parameters ---
+    # if args.algo_type == 'hybrid_xgb':
+    #     if args.ppo_lr is not None: algo_kwargs['ppo_lr'] = args.ppo_lr
+    #     if args.awr_beta is not None:          algo_kwargs['awr_beta'] = args.awr_beta
+    #     if args.max_depth is not None:     algo_kwargs['max_depth'] = args.max_depth
+    #     if args.use_ppo_clip is not None:          algo_kwargs['use_ppo_clip'] = args.use_ppo_clip
+    #     if args.obs_dependent_std is not None:     algo_kwargs['obs_dependent_std'] = args.obs_dependent_std
+    #     if args.learning_rate is not None:      algo_kwargs['learning_rate'] = args.learning_rate
+    # # -------------------------------------------------------------------------
 
     print(f"Training with algo_kwargs: {algo_kwargs}")
 

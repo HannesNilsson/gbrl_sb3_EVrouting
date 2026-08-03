@@ -307,8 +307,8 @@ def parse_args():
     parser.add_argument('--feature_weights', type=json_string_to_list)
 
     #HYBRID_XGB params
-    parser.add_argument('--ppo_lr', type=float)
-    parser.add_argument('--awr_beta', type=float)
+    parser.add_argument('--ppo_lr', type=float, default=0.02, help='Learning rate for PPO')
+    parser.add_argument('--awr_beta', type=float, default=0.05, help='Advantage weighting beta for AWR')
     parser.add_argument('--use_ppo_clip', action='store_true')
     parser.add_argument('--obs_dependent_std', action='store_true')
     parser.add_argument('--awr_update_freq', type=int)
@@ -1078,7 +1078,7 @@ def process_policy_kwargs(args):
             'max_depth': args.max_depth,
             'tree_method': 'hist',
             'base_score': 0,
-            'eta': args.learning_rate  # Using the bridged PPO LR
+            'eta': args.learning_rate
         }
         
         default_critic_params = {
@@ -1093,8 +1093,8 @@ def process_policy_kwargs(args):
             "n_estimators": args.n_estimators if hasattr(args, 'n_estimators') and args.n_estimators else 500,
             "awr_update_freq": args.awr_update_freq if hasattr(args, 'awr_update_freq') else 10000,
             "awr_buffer_size": args.awr_buffer_size if hasattr(args, 'awr_buffer_size') else 15000,
-            "learning_rate": args.learning_rate,
-            "beta": args.beta,
+            "ppo_lr": args.ppo_lr,
+            "awr_beta": args.awr_beta,
             "n_steps": args.n_steps,
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,

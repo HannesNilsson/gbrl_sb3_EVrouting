@@ -2,11 +2,13 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
+from gymnasium.envs.registration import register
 
 class EVCorridorEnv(gym.Env):
     """
     Lifelong Reinforcement Learning Environment for Heavy-Duty EV Trucking.
     Alternates dynamically between Northbound and Southbound routes.
+    Includes Academic Battery Degradation & Sim-to-Real Stochasticity.
     """
     
     def __init__(self):
@@ -38,7 +40,7 @@ class EVCorridorEnv(gym.Env):
         # Fleet Economics
         self.pack_cost_per_kwh = 150.0 
         self.total_pack_cost = self.pack_cost_per_kwh * self.factory_max_kwh 
-        self.usable_life_fraction = 0.20 
+        self.usable_life_fraction = 0.30 
         self.base_cycle_life = 10000.0
         total_lifetime_kwh = self.factory_max_kwh * self.base_cycle_life
         self.base_cost_per_kwh = self.total_pack_cost / (total_lifetime_kwh * self.usable_life_fraction)
@@ -47,12 +49,18 @@ class EVCorridorEnv(gym.Env):
         self.energy_cost_per_kwh = 0.40
         self.freight_rate_per_km = 3.50
 
-        # 3. SET INITIAL ROUTE (Start Northbound)
+        # --- 3. ACADEMIC DEGRADATION & STOCHASTICITY ---
+        self.beta_crate = 1.38        # Wang et al. (2011) Exponential C-rate stress
+        self.k_low_soc = 6.0         # Mechanical stress steepness (deep discharge)
+        self.k_high_soc = 4.0        # Voltage stress steepness (high charge)
+        self.noise_std_dev = 0.05     # Sim-to-Real Multiplicative Noise
+
+        # 4. SET INITIAL ROUTE (Start Northbound)
         self.is_northbound = True
         self._set_active_route()
         
         # --- RL SPACES ---
-        # AI sees: [-1.0, 1.0] for both actions
+        # AI sees: [-1.0, 1.0] for both actions [Time, Power]
         self.action_space = spaces.Box(
             low=-1.0, 
             high=1.0, 
@@ -60,6 +68,7 @@ class EVCorridorEnv(gym.Env):
             dtype=np.float32
         )
         
+        # 16-Dimensional Radar Observation Space
         self.observation_space = spaces.Box(
             low=-1.0, high=np.inf, shape=(16,), dtype=np.float32
         )
@@ -92,7 +101,6 @@ class EVCorridorEnv(gym.Env):
                 if charger_idx >= num_stations - 1:
                     break
                     
-                # 🐛 THE FIX: Update the target ID for the next loop!
                 target_charger_id = chargers_df.iloc[charger_idx + 1]['id']
                     
         return powers, dists, times
@@ -100,11 +108,9 @@ class EVCorridorEnv(gym.Env):
     def _set_active_route(self):
         """Instantly swaps the active memory arrays. No math, no printing!"""
         if self.is_northbound:
-            # 🐛 THE FIX: Re-added the dataframe pointers so reset() doesn't crash!
             self.chargers_df = self.north_chargers
             self.start_node = self.north_chargers.iloc[0]['id']
             self.target_node = self.north_chargers.iloc[-1]['id']
-            
             self.charger_powers = self.north_powers
             self.jump_distances = self.north_dists
             self.jump_times = self.north_times
@@ -113,7 +119,6 @@ class EVCorridorEnv(gym.Env):
             self.chargers_df = self.south_chargers
             self.start_node = self.south_chargers.iloc[0]['id']
             self.target_node = self.south_chargers.iloc[-1]['id']
-            
             self.charger_powers = self.south_powers
             self.jump_distances = self.south_dists
             self.jump_times = self.south_times
@@ -125,10 +130,10 @@ class EVCorridorEnv(gym.Env):
 
         # 1. LIFELONG HEALTH CHECK
         state_of_health = self.current_max_kwh / self.factory_max_kwh
-        battery_dead = state_of_health < 0.70 # Or 0.80 based on your fraction
+        battery_dead = state_of_health < 0.70 
         
         if battery_dead:
-            print(f"🔧 BATTERY SWAP (Trip {self.lifetime_trips}): Selling degraded pack to grid storage for €72,000. Installing fresh pack...")
+            print(f"🔧 BATTERY SWAP (Trip {self.lifetime_trips}): Selling degraded pack to grid storage. Installing fresh pack...")
             self.current_max_kwh = self.factory_max_kwh
             self.lifetime_trips = 0
             self.is_northbound = True
@@ -152,11 +157,10 @@ class EVCorridorEnv(gym.Env):
 
     def step(self, action):
         # 1. UN-SQUASH THE ACTIONS
-        # Convert [-1.0, 1.0] to [0.0, 1.0]
+        # Convert [-1.0, 1.0] to real-world physics limits
         normalized_time = (action[0] + 1.0) / 2.0
         normalized_power = (action[1] + 1.0) / 2.0
         
-        # Scale up to real-world physics limits!
         charge_time_hr = normalized_time * 11.0
         requested_power_kw = normalized_power * 1000.0
         
@@ -169,10 +173,9 @@ class EVCorridorEnv(gym.Env):
             station_max_kw = self.chargers_df.iloc[self.current_node_idx]['power_kw']
             hardware_limit_kw = min(requested_power_kw, station_max_kw, self.truck_max_kw)
             total_minutes = int(charge_time_hr * 60)
-            chunk_size = 5 # Calculate physics in 5-minute blocks!
+            chunk_size = 5 # Calculate physics in 5-minute blocks
             
             for minute in range(0, total_minutes, chunk_size):
-                # Ensure we don't over-calculate the final partial chunk
                 actual_chunk = min(chunk_size, total_minutes - minute) 
                 
                 current_soc = self.battery / self.current_max_kwh
@@ -184,14 +187,22 @@ class EVCorridorEnv(gym.Env):
                 else:
                     actual_power_kw = hardware_limit_kw * ((1.0 - current_soc) / (1.0 - threshold))
                 
-                energy_added = actual_power_kw / 60.0
+                energy_added = (actual_power_kw / 60.0) * actual_chunk
                 self.battery += energy_added
                 energy_delivered_kwh += energy_added
                 
+                # --- ACADEMIC CHARGE STRESS MODEL ---
                 c_rate = actual_power_kw / self.factory_max_kwh
-                power_stress = 1.0 + (0.5 * (c_rate ** 2))
-                voltage_stress = np.exp(8.0 * (current_soc - 0.80)) if current_soc > 0.80 else 1.0
-                total_stress = power_stress * voltage_stress
+                
+                # Wang et al. (2011) Exponential Power Stress
+                power_stress = np.exp(self.beta_crate * c_rate)
+                
+                # Schmalstieg / Xu Voltage Stress
+                voltage_stress = np.exp(self.k_high_soc * (current_soc - 0.80)) if current_soc > 0.80 else 1.0
+                
+                # Apply Sim-to-Real Multiplicative Noise
+                noise_multiplier = max(0.1, np.random.normal(1.0, self.noise_std_dev))
+                total_stress = power_stress * voltage_stress * noise_multiplier
                 
                 minute_cost = (energy_added * self.base_cost_per_kwh) * total_stress
                 degradation_cost_eur += minute_cost
@@ -218,16 +229,15 @@ class EVCorridorEnv(gym.Env):
         next_node_idx = self.current_node_idx + 1
         next_node_id = self.chargers_df.iloc[next_node_idx]['id']
         
-        # ⚡ INSTANT O(1) LOOKUP! (No NetworkX needed)
+        # ⚡ INSTANT O(1) LOOKUP
         distance_km = self.jump_distances[self.current_node_idx]
         travel_time_hr = self.jump_times[self.current_node_idx]
         stop_overhead_hr = 0.25 if charge_time_hr > 0 else 0.0
         
-        # Fail-safe check in case of bad map data
+        # Fail-safe check
         if distance_km > 9000:
             return self._get_obs(), -5000, True, False, {"reason": "map_disconnected"}
             
-        # ... [Inside Phase 2] ...
         expected_energy = distance_km * self.consumption_mean
         actual_energy = np.random.normal(expected_energy, distance_km * self.consumption_std)
         
@@ -245,17 +255,23 @@ class EVCorridorEnv(gym.Env):
         # ==========================================
         starting_soc = (self.battery + actual_energy) / self.current_max_kwh
         ending_soc = self.battery / self.current_max_kwh
-        avg_soc = (starting_soc + ending_soc) / 2.0
+        
+        # 🟢 ADD THIS LINE: Prevent exponential explosion if the truck dies
+        avg_soc = np.clip((starting_soc + ending_soc) / 2.0, 0.0, 1.0)
         
         stress_multiplier = 1.0 
         
-        # 2. Low SOC Mechanical Stress
+        # Low SOC Mechanical Stress (Xu et al.)
         if avg_soc < 0.30:
-            stress_multiplier += np.exp(5.0 * (0.30 - avg_soc)) - 1.0
+            stress_multiplier += np.exp(self.k_low_soc * (0.30 - avg_soc)) - 1.0
             
-        # 3. High SOC Voltage Stress
+        # High SOC Voltage Stress (Schmalstieg et al.)
         if avg_soc > 0.80:
-            stress_multiplier += np.exp(3.0 * (avg_soc - 0.80)) - 1.0
+            stress_multiplier += np.exp(self.k_high_soc * (avg_soc - 0.80)) - 1.0
+            
+        # Apply Sim-to-Real Multiplicative Noise to driving
+        noise_multiplier = max(0.1, np.random.normal(1.0, self.noise_std_dev))
+        stress_multiplier *= noise_multiplier
             
         continuous_damage_eur = (actual_energy * self.base_cost_per_kwh) * stress_multiplier
         
@@ -269,7 +285,7 @@ class EVCorridorEnv(gym.Env):
         step_revenue_eur = distance_km * self.freight_rate_per_km
         step_cost_eur += travel_time_hr * self.driver_wage_per_hr
         
-        # Subtract the continuous physical damage from the profit
+        # Total profit calculation
         step_profit = step_revenue_eur - (step_cost_eur + degradation_cost_eur + continuous_damage_eur)
         
         self.current_node_idx = next_node_idx
@@ -277,46 +293,27 @@ class EVCorridorEnv(gym.Env):
         
         # --- 3. FATAL PENALTIES & REWARDS ---
         
-        # A. Out of Battery (Death)
+        # A. Out of Battery
         if self.battery <= 0:
             return self._get_obs(), -100.0, True, False, {"reason": "out_of_battery"}
 
-        # B. Destination Reached (Dynamic Bonus)
+        # B. Destination Reached
         if self.current_node_idx >= self.num_stations - 1:
-            # Logic: Start with a high bonus (e.g., 100 points / €10,000)
-            # Subtract 2 points for every hour the trip took.
-            # Example: 15hr trip = 100 - 30 = 70 points.
-            #          40hr trip = 100 - 80 = 20 points.
             arrival_bonus = max(0.0, 100.0 - (2.0 * self.total_time_today))
-            
             return self._get_obs(), arrival_bonus, True, False, {"reason": "reached_destination"}
 
-        # C. Standard Step Reward (Profit / 100)
+        # C. Standard Step Reward
         scaled_reward = step_profit / 100.0
-        return self._get_obs(), scaled_reward, False, False, {}
-
-
-        # # ==========================================
-        # # 🐛 DEBUGGING: THE REPAIRED DUMMY REWARD
-        # # ==========================================
-        # # 1. THE CLIFF: Did the AI try to skip the charger?
-        # if charge_time_hr < 0.1:
-        #     dummy_reward = -100.0  # Massive punishment for skipping!
         
-        # # 2. THE SLOPE: It decided to charge! Now guide it to [0.5, 200]
-        # else:
-        #     # We don't normalize to 11.0 anymore, we just use raw distance
-        #     error_time = abs(charge_time_hr - 0.5) 
-        #     error_power = abs(requested_power_kw - 200.0) / 100.0 # Scaled down so it isn't overwhelming
-            
-        #     # Start with 100 points, subtract points for being inaccurate
-        #     dummy_reward = 100.0 - (15.0 * error_time) - (10.0 * error_power)
-            
-        # reward = dummy_reward
-        # # ==========================================
-
-        # return self._get_obs(), reward, False, False, {}
-
+        # Track metrics for Tensorboard & Analysis
+        info = {
+            "deg_cost_eur": degradation_cost_eur + continuous_damage_eur,
+            "energy_cost_eur": energy_delivered_kwh * self.energy_cost_per_kwh,
+            "step_profit": step_profit,
+            "battery_health_fraction": self.current_max_kwh / self.factory_max_kwh
+        }
+        
+        return self._get_obs(), scaled_reward, False, False, info
 
 
     def _get_expected_trip(self, start_idx, target_idx):
@@ -324,13 +321,13 @@ class EVCorridorEnv(gym.Env):
         if start_idx >= target_idx or target_idx >= self.num_stations:
             return -1.0, -1.0
             
-        # Just add up the precalculated chunks from the 1D track!
         dist = np.sum(self.jump_distances[start_idx:target_idx])
         time = np.sum(self.jump_times[start_idx:target_idx])
         
         return dist * self.consumption_mean, time
 
     def _get_obs(self):
+        """Constructs the 16-dimensional observation vector (Radar)."""
         energy_to_dest, _ = self._get_expected_trip(self.current_node_idx, self.num_stations - 1)
         current_station_kw = self.charger_powers[self.current_node_idx]
         
@@ -343,6 +340,7 @@ class EVCorridorEnv(gym.Env):
             current_station_kw
         ]
         
+        # Radar: Lookahead 3 stations
         for offset in [1, 2, 3]:
             lookahead_idx = self.current_node_idx + offset
             if lookahead_idx < self.num_stations:
