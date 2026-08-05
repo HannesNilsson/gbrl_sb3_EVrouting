@@ -1,531 +1,896 @@
-import numpy as np
+"""
+Tree Ensemble Reinforcement Learning (TERL) with XGBoost function approximators.
+
+A fixed-size actor/critic ensemble is rebuilt periodically with Advantage-Weighted
+Regression (macro-update) and refined in between by on-policy leaf-value updates
+(micro-update, A2C or PPO), following Algorithm 1 of the paper.
+
+Fixes relative to the first draft implementation
+------------------------------------------------
+ 1.  AWR sample weights are actually passed to XGBoost.  Previously
+     `_prepare_dmatrix` accepted `weight` and silently dropped it, which turned
+     the macro-update into unweighted behaviour cloning - i.e. no off-policy
+     policy improvement at all, and an update that *reset* the policy toward the
+     mean action in the replay buffer.
+ 2.  The critic is fit unweighted.  Advantage-weighting the value regression
+     biases it away from V^pi.
+ 3.  The critic's leaves are micro-updated too, as Algorithm 1 line 9 requires
+     ("...new critic and actor tree ensembles V_{k,l+1}, pi_{k,l+1}").  The old
+     code computed critic leaf statistics, never used them, and populated
+     `leaf_mean` from a nonexistent `leaf_weight` dump key.
+ 4.  Per-observation variance is the *mean* across boosting rounds of the
+     per-leaf variance of the full-ensemble residual, not the sum of per-round
+     residual variances.  Summing 500 strongly-correlated residual variances
+     saturated the [1e-4, 5.0] clip, pinning the exploration std at ~2.24 for
+     every state and both action dimensions.
+ 5.  Leaf updates are normalised (per-leaf mean by default) instead of summed,
+     so the effective learning rate no longer scales with n_steps * n_envs and
+     is no longer proportional to leaf population.
+ 6.  The PPO variant uses the real clipped-surrogate gradient
+     grad = ratio * A * dlog pi, masked where the clip binds.  The old version
+     dropped the ratio factor, making it A2C with a masking heuristic.
+ 7.  The actor uses one *shared* tree structure with vector-valued leaves
+     (XGBoost `multi_strategy="multi_output_tree"`, requires XGBoost >= 2.0),
+     so a single ensemble of `n_estimators` trees parameterises the whole
+     policy - matching the paper's "actor tree ensemble pi" rather than one
+     ensemble per action dimension.  The old code assumed an unverified
+     ordering of XGBoost's multi-output dump; a wrong layout would have
+     silently scrambled dimensions.  The layout is now checked explicitly
+     (tree count, vector leaf arity, `pred_leaf` shape) and the reconstructed
+     mean is verified against `Booster.predict`.  `shared_tree_structure=False`
+     falls back to one single-output booster per dimension.
+ 8.  The r=0 residual no longer excludes tree 0's own contribution.
+ 9.  Per-tree Python loops replaced by a single offset bincount.
+10.  AWR trigger uses a step counter instead of modulo arithmetic that can
+     double-fire or drift.
+11.  Truncated episodes are bootstrapped with gamma * V(terminal_obs).
+12.  Observations are stored as float32 in the SB3 buffer directly (the parallel
+     object-dtype buffer and the zero-filled dummy observations are gone).
+13.  Adds `predict`, save/load, and diagnostics: `train/macro_mu_delta` vs
+     `train/micro_mu_delta` (how far each update actually moves the policy
+     mean), `policy/std_dim*`, `policy/var_at_ceiling_dim*`,
+     `train/clip_fraction`, `train/approx_kl`, `train/explained_variance`.
+14.  Variance bounds and the global log-std are per action dimension.  A single
+     scalar scale is wrong when T_charging spans [0, 11] and C_target [0, 2].
+"""
+
+from __future__ import annotations
+
 import json
-import xgboost as xgb
-import torch as th
-import pandas as pd
 import time
-from stable_baselines3.common.buffers import RolloutBuffer
+import pickle
+import warnings
 from collections import deque
 
+import numpy as np
+import xgboost as xgb
+
+
+# --------------------------------------------------------------------------- #
+# Tree dump helpers
+# --------------------------------------------------------------------------- #
 
 def get_leafs(tree: dict) -> dict:
     """Iterative leaf extraction from an XGBoost JSON-dump tree node."""
-    leafs = {}
-    stack = [tree]
+    leafs, stack = {}, [tree]
     while stack:
         node = stack.pop()
-        try:
-            stack.append(node['children'][0])
-            stack.append(node['children'][1])
-        except KeyError:
-            leafs[node['nodeid']] = node
+        children = node.get("children")
+        if children:
+            stack.extend(children)
+        else:
+            leafs[node["nodeid"]] = node
     return leafs
 
 
+def _native_leaf_array(leaves_per_tree, n_trees, max_lid):
+    """(n_trees, max_lid+1) array of XGBoost's own leaf weights."""
+    arr = np.zeros((n_trees, max_lid + 1), dtype=np.float64)
+    for i, tree in enumerate(leaves_per_tree):
+        for lid, node in tree.items():
+            arr[i, lid] = node.get("leaf", 0.0)
+    return arr
+
+
+def _native_leaf_array_multi(leaves_per_tree, n_trees, max_lid, action_dim):
+    """(action_dim, n_trees, max_lid+1) array from vector-valued leaves.
+
+    A `multi_output_tree` dump stores each leaf as a list of `action_dim`
+    values, e.g. {"nodeid": 7, "leaf": [-0.33, 0.06]}.
+    """
+    arr = np.zeros((action_dim, n_trees, max_lid + 1), dtype=np.float64)
+    for i, tree in enumerate(leaves_per_tree):
+        for lid, node in tree.items():
+            v = np.atleast_1d(np.asarray(node.get("leaf", 0.0), dtype=np.float64))
+            if v.size != action_dim:
+                raise RuntimeError(
+                    f"tree {i} leaf {lid} has arity {v.size}, expected "
+                    f"{action_dim}. The booster is not a multi-output tree - "
+                    "check that multi_strategy='multi_output_tree' was accepted."
+                )
+            arr[:, i, lid] = v
+    return arr
+
+
+def _leaf_stats(leaf_ids, residual, n_trees, n_leaf_slots):
+    """Per-(tree, leaf) count / mean / variance of `residual`.
+
+    leaf_ids : (N, n_trees) int
+    residual : (N,) float - residual of the *full* ensemble prediction
+
+    A single flattened bincount replaces the per-tree Python loop.
+    """
+    n = leaf_ids.shape[0]
+    offsets = np.arange(n_trees, dtype=np.int64) * n_leaf_slots
+    flat = (leaf_ids.astype(np.int64) + offsets[None, :]).ravel()
+    w = np.repeat(residual.astype(np.float64), n_trees)  # row-major match
+
+    size = n_trees * n_leaf_slots
+    cnt = np.bincount(flat, minlength=size).astype(np.float64)
+    s1 = np.bincount(flat, weights=w, minlength=size)
+    s2 = np.bincount(flat, weights=w * w, minlength=size)
+
+    safe = cnt > 0
+    denom = np.where(safe, cnt, 1.0)
+    mean = np.where(safe, s1 / denom, 0.0)
+    var = np.where(cnt > 1, np.maximum(s2 / denom - mean ** 2, 0.0), 0.0)
+
+    shape = (n_trees, n_leaf_slots)
+    return cnt.reshape(shape), mean.reshape(shape), var.reshape(shape)
+
+
+def _scatter_leaf_update(leaf_ids, per_sample_step, tree_weights,
+                         n_trees, n_leaf_slots, normalization):
+    """Aggregate per-sample steps into a (n_trees, n_leaf_slots) leaf delta.
+
+    normalization
+        'leaf_mean'  - mean gradient inside each leaf  (default)
+        'batch_mean' - sum divided by batch size
+        'sum'        - raw sum (the original behaviour; lr then scales with N)
+    """
+    n = leaf_ids.shape[0]
+    offsets = np.arange(n_trees, dtype=np.int64) * n_leaf_slots
+    flat = (leaf_ids.astype(np.int64) + offsets[None, :]).ravel()
+
+    w = (per_sample_step[:, None] * tree_weights[None, :]).ravel()
+    size = n_trees * n_leaf_slots
+    sums = np.bincount(flat, weights=w, minlength=size)
+
+    if normalization == "leaf_mean":
+        cnt = np.bincount(flat, minlength=size).astype(np.float64)
+        upd = sums / np.maximum(cnt, 1.0)
+    elif normalization == "batch_mean":
+        upd = sums / max(n, 1)
+    elif normalization == "sum":
+        upd = sums
+    else:
+        raise ValueError(f"unknown normalization {normalization!r}")
+
+    return upd.reshape(n_trees, n_leaf_slots)
+
+
+class _LeafAdam:
+    """Per-leaf Adam moments for leaf-value updates.
+
+    Raw SGD on leaf values does not work here.  The per-leaf mean of
+    A * (a - mu) / var is a near-zero-mean quantity whose magnitude depends on
+    the advantage scale, the action scale and the current variance, so a fixed
+    learning rate produces a step that is orders of magnitude too small (on
+    Pendulum the micro-update moved the policy mean by 1e-3 per iteration
+    against an action range of 4).  Neural PPO does not have this problem
+    because Adam normalises the per-parameter gradient magnitude; this does the
+    same for leaves, so a step is ~lr regardless of gradient scale.
+    """
+
+    def __init__(self, shape, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.m = np.zeros(shape)
+        self.v = np.zeros(shape)
+        self.beta1, self.beta2, self.eps = beta1, beta2, eps
+        self.t = 0
+
+    def step(self, grad):
+        self.t += 1
+        self.m = self.beta1 * self.m + (1.0 - self.beta1) * grad
+        self.v = self.beta2 * self.v + (1.0 - self.beta2) * grad ** 2
+        mhat = self.m / (1.0 - self.beta1 ** self.t)
+        vhat = self.v / (1.0 - self.beta2 ** self.t)
+        return mhat / (np.sqrt(vhat) + self.eps)
+
+
+def _target_ess_beta(adv, target_ess, clip, lo=0.05, hi=50.0, iters=40):
+    """AWR temperature giving an effective sample size fraction of `target_ess`.
+
+    With normalised advantages and a fixed beta=0.5, exp(2A) clipped at 20 has
+    an effective sample size of 3-7% of the buffer: the regression is then
+    high-variance cloning of a handful of lucky trajectories.  ESS is monotone
+    increasing in beta, so a bisection pins it to a chosen value.
+    """
+    def ess(b):
+        w = np.exp(np.clip(adv / b, -50.0, 50.0) - np.max(adv / b))
+        w = np.clip(w, 0.0, clip)
+        return w.sum() ** 2 / (len(w) * (w ** 2).sum() + 1e-12)
+
+    if ess(hi) < target_ess:
+        return hi
+    if ess(lo) > target_ess:
+        return lo
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if ess(mid) < target_ess:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _inverse_magnitude_weights(leaf_means, counts):
+    """Per-tree weights inversely proportional to mean |leaf value|.
+
+    Early boosting rounds carry the bulk of the signal and have large leaf
+    values; later rounds fit small residuals.  Normalising by magnitude puts
+    every tree on the same scale.  Weights sum to 1, so the total change in the
+    ensemble output equals lr * grad.
+    """
+    mask = counts > 0
+    num = np.abs(leaf_means * mask).sum(axis=1)
+    den = np.maximum(mask.sum(axis=1), 1)
+    mean_abs = num / den
+    raw = 1.0 / (mean_abs + 1e-8)
+    return (raw / raw.sum()).astype(np.float64)
+
+
+# --------------------------------------------------------------------------- #
+# Core engine
+# --------------------------------------------------------------------------- #
+
 class XGBoostTreeEngine:
+    """Fixed-size XGBoost actor/critic with AWR rebuilds and leaf-value updates.
+
+    Layout
+    ------
+    By default the actor is a single booster trained with
+    `multi_strategy="multi_output_tree"`: one shared tree structure per boosting
+    round, whose leaves hold an `action_dim`-vector.  `pred_leaf` therefore
+    returns (N, n_estimators) - one leaf index per round, shared by all output
+    dimensions.  With `shared_tree_structure=False` the actor is instead one
+    single-output booster per dimension, each also yielding (N, n_estimators).
+
+    Either way the downstream maths is identical, because `_leaf_ids` returns a
+    per-dimension list of (N, n_estimators) index arrays (the same array
+    repeated in shared mode).  With
+
+        mu[:, d]  = base_score + sum_r  actor_leaf_means[d][r, leaf(r)]
+        var[:, d] = mean_r          actor_leaf_vars[d][r, leaf(r)]
+        V         = base_score + sum_r  critic_leaf_means[r, leaf(r)]
+
+    `actor_leaf_means` is initialised from XGBoost's own leaf weights after each
+    AWR rebuild and then moved in place by the micro-updates.
     """
-    Core math engine: vectorized NumPy inference and gradient updates.
 
-    Architecture
-    ------------
-    * Actor  – one XGBoost multi-output regressor; get_dump yields
-               n_estimators * action_dim trees (one tree per output per round).
-               Tree index i handles action dimension  i % action_dim.
-    * Critic – standard single-output regressor.
+    def __init__(
+        self,
+        action_dim: int,
+        max_depth: int,
+        n_estimators: int,
+        ppo_lr: float,
+        awr_beta: float,
+        action_low,
+        action_high,
+        clip_ratio: float = 0.2,
+        use_ppo_clip: bool = False,
+        obs_dependent_std: bool = True,
+        n_ppo_epochs: int = 4,
+        critic_lr: float | None = None,
+        ent_coef: float = 0.0,
+        var_min: float = 1e-3,
+        var_max: float | None = None,
+        leaf_update_norm: str = "leaf_mean",
+        actor_eta: float = 0.05,
+        critic_eta: float = 0.05,
+        awr_weight_clip: float = 20.0,
+        awr_target_ess: float | None = 0.3,
+        target_kl: float | None = None,
+        grad_clip: float = 10.0,
+        shared_tree_structure: bool = True,
+        verify_reconstruction: bool = True,
+    ):
+        self.action_dim = int(action_dim)
+        self.n_estimators = int(n_estimators)
+        self.ppo_lr = float(ppo_lr)
+        self.critic_lr = float(ppo_lr if critic_lr is None else critic_lr)
+        self.awr_beta = float(awr_beta)
+        self.clip_ratio = float(clip_ratio)
+        self.action_low = np.asarray(action_low, dtype=np.float64)
+        self.action_high = np.asarray(action_high, dtype=np.float64)
+        # Leaf steps are Adam-normalised, so `ppo_lr` is a *fraction of the
+        # action range* per micro-update, not a raw gradient multiplier.
+        self.mu_step = self.ppo_lr * (self.action_high - self.action_low)
 
-    Fast arrays (built after every AWR macro-update)
-    ------------------------------------------------
-    fast_leaf_means_arr  : (total_trees, max_leaf_id+1)  float32
-        Current policy mean per leaf.  Updated in-place by micro-PPO.
-    native_leaf_weights_arr : (total_trees, max_leaf_id+1)  float32
-        XGBoost's own leaf weights, used only for residual reconstruction
-        in train_macro_awr (avoids n_estimators*action_dim predict calls).
-    """
+        self.use_ppo_clip = bool(use_ppo_clip)
+        self.obs_dependent_std = bool(obs_dependent_std)
+        # A2C uses a single pass: without a trust region extra epochs just let
+        # the policy diverge.  PPO needs >= 2 for the clip to ever bind, since
+        # on epoch 1 the policy has not moved and ratio == 1 everywhere.
+        self.n_ppo_epochs = int(n_ppo_epochs) if self.use_ppo_clip else 1
 
-    def __init__(self, action_dim, max_depth, n_estimators, ppo_lr, awr_beta,
-                 action_low, action_high, clip_ratio=0.2,
-                 use_ppo_clip=False, obs_dependent_std=True, n_ppo_epochs=4):
-        self.action_dim          = action_dim
-        self.n_estimators        = n_estimators
-        self.ppo_lr              = ppo_lr
-        self.awr_beta            = awr_beta
-        self.clip_ratio          = clip_ratio
-        self.action_low          = action_low
-        self.action_high         = action_high
-        # ---- Algorithm variant flags ----
-        # use_ppo_clip     : True  → PPO clipped surrogate (masks samples where
-        #                            the policy has already moved too far)
-        #                    False → plain A2C (raw policy gradient, no ratio)
-        # obs_dependent_std: True  → per-leaf aleatoric variance (different
-        #                            exploration width per state region)
-        #                    False → single global log_std vector shared across
-        #                            all observations
-        self.use_ppo_clip        = use_ppo_clip
-        self.obs_dependent_std   = obs_dependent_std
-        # Number of gradient passes over each rollout batch.
-        # A2C always uses 1 — extra epochs make no sense without a trust region
-        # because the policy can diverge. PPO needs ≥ 2 for the clip to ever
-        # fire: on epoch 1 ratio == 1.0 everywhere (policy hasn't moved yet).
-        self.n_ppo_epochs = n_ppo_epochs
-        if not obs_dependent_std:
-            # Global log-std, one value per action dimension
-            self.log_std = np.zeros(action_dim, dtype=np.float32)
+        self.ent_coef = float(ent_coef)
+        # Variance bounds are per action dimension: a T_charging range of [0, 11]
+        # and a C_target range of [0, 2] must not share one exploration scale.
+        span = self.action_high - self.action_low
+        self.var_min = np.full(self.action_dim, float(var_min))
+        self.var_max = (
+            np.full(self.action_dim, float(var_max)) if var_max is not None
+            else (span / 2.0) ** 2
+        )
+        self.leaf_update_norm = leaf_update_norm
+        self.awr_weight_clip = float(awr_weight_clip)
+        self.awr_target_ess = awr_target_ess
+        self.target_kl = target_kl
+        self.grad_clip = float(grad_clip)
+        self.shared_tree_structure = bool(shared_tree_structure)
+        self.verify_reconstruction = bool(verify_reconstruction)
 
-        self.actor_model  = None
-        self.critic_model = None
+        if self.shared_tree_structure:
+            major = int(str(xgb.__version__).split(".")[0])
+            if major < 2:
+                raise RuntimeError(
+                    f"shared_tree_structure requires XGBoost >= 2.0 "
+                    f"(multi_strategy='multi_output_tree'); found {xgb.__version__}. "
+                    "Pass shared_tree_structure=False for one booster per "
+                    "action dimension."
+                )
 
-        self.actor_leaves_per_tree  = None
-        self.critic_leaves_per_tree = None
-
-        # Dense memory banks (allocated after first AWR update)
-        self.fast_leaf_means_arr    = None   # (total_trees, max_lid+1)
-        self.native_leaf_weights_arr = None  # (total_trees, max_lid+1)
-        self._max_leaf_id           = 0
-        self._total_trees           = 0      # n_estimators * action_dim
-        self._dim_indices           = None   # (total_trees,)  i % action_dim
+        if not self.obs_dependent_std:
+            self.log_std = np.log(0.25 * span).astype(np.float64)
 
         self.actor_params = {
-            'objective':  'reg:squarederror',
-            'max_depth':  max_depth,
-            'tree_method':'hist',
-            'base_score': 0,
-            'eta':        0.01,
-            'verbosity':  0,
+            "objective": "reg:squarederror",
+            "max_depth": max_depth,
+            "tree_method": "hist",
+            "base_score": 0.0,
+            "eta": actor_eta,
+            "verbosity": 0,
         }
-        self.critic_params = {
-            'objective':  'reg:squarederror',
-            'max_depth':  max_depth,
-            'tree_method':'hist',
-            'base_score': 0,
-            'eta':        0.01,
-            'verbosity':  0,
-        }
-        self.actor_lr  = self.actor_params['eta']
-        self.critic_lr = self.critic_params['eta']
+        self.critic_params = dict(self.actor_params, eta=critic_eta)
+        if self.shared_tree_structure:
+            # One tree per round, leaves carry an action_dim-vector.
+            self.actor_params["multi_strategy"] = "multi_output_tree"
 
+        self.actor_models: list[xgb.Booster] | None = None
+        self.critic_model: xgb.Booster | None = None
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        self.actor_leaf_means = None    # (D, n_est, L)
+        self.actor_leaf_vars = None     # (D, n_est, L)
+        self.actor_tree_weights = None  # (D, n_est)
+        self.critic_leaf_means = None   # (n_est, L)
+        self.critic_tree_weights = None # (n_est,)
+        self._n_leaf_slots = 0
+        # Adam moments; reset on every macro rebuild since the partition changes.
+        self._adam_mu = self._adam_var = self._adam_v = None
+        self._return_scale = 1.0
 
-    def _prepare_dmatrix(self, X, label=None, weight=None):
-        enable_cat = False
-        if X.dtype == object or X.dtype.kind in {'S', 'U'}:
-            if X.ndim == 1:
-                X = X.reshape(-1, 1)
-            if isinstance(X.flat[0], bytes):
-                X = np.char.decode(X.astype('S'), 'utf-8')
-            try:
-                X = X.astype(np.float32)
-            except ValueError:
-                df = pd.DataFrame(X)
-                for col in df.columns:
-                    df[col] = df[col].astype('category')
-                X = df
-                enable_cat = True
-        # NOTE: weight is accepted in the signature for call-site compatibility
-        # but intentionally not forwarded to DMatrix, matching the original.
-        return xgb.DMatrix(X, label=label, enable_categorical=enable_cat)
+        self.last_diagnostics: dict = {}
 
-    def _build_fast_arrays(self):
-        """
-        Convert actor_leaves_per_tree dicts into dense numpy arrays for
-        O(1) vectorized lookup.  Called at the end of every AWR update.
-        """
-        total_trees = self.n_estimators * self.action_dim
-        self._total_trees = total_trees
-        self._dim_indices = np.arange(total_trees, dtype=np.int32) % self.action_dim
+    # ------------------------------------------------------------------ #
+    # Data plumbing
+    # ------------------------------------------------------------------ #
 
-        max_lid = max(
-            (max(d.keys()) for d in self.actor_leaves_per_tree if d),
-            default=0
-        )
-        self._max_leaf_id = max_lid
+    @staticmethod
+    def _dmatrix(X, label=None, weight=None):
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        return xgb.DMatrix(X, label=label, weight=weight)
 
-        means   = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
-        native  = np.zeros((total_trees, max_lid + 1), dtype=np.float32)
-        if self.obs_dependent_std:
-            # Aleatoric variance per (tree, leaf): var(residuals) * lr^2.
-            # Summed across trees to give per-observation exploration width.
-            vars_ = np.full((total_trees, max_lid + 1), 1e-4, dtype=np.float32)
-
-        for i, tree_dict in enumerate(self.actor_leaves_per_tree):
-            for lid, ldata in tree_dict.items():
-                means[i, lid]  = ldata.get('leaf_mean',
-                                 ldata.get('leaf_weight', 0.0))
-                native[i, lid] = ldata.get('leaf', 0.0)
-                if self.obs_dependent_std:
-                    vars_[i, lid] = max(ldata.get('leaf_variance', 1e-4), 1e-4)
-
-        self.fast_leaf_means_arr     = means
-        self.native_leaf_weights_arr = native
-        if self.obs_dependent_std:
-            self.fast_leaf_vars_arr = vars_
-
-        # Per-tree update weights: inversely proportional to each tree's mean
-        # absolute leaf value.  Early boosting rounds fit the full signal and
-        # tend to have large leaf values; later rounds fit small residuals and
-        # have small leaf values.  Normalizing by magnitude puts all trees on
-        # the same scale before applying the gradient.
-        # Weights are normalized to sum to 1 so the total update magnitude
-        # across the ensemble equals ppo_lr * grad_mu — same as before.
-        mean_abs = np.zeros(total_trees, dtype=np.float32)
-        for i, tree_dict in enumerate(self.actor_leaves_per_tree):
-            vals = np.array([
-                ldata.get('leaf_mean', ldata.get('leaf_weight', 0.0))
-                for ldata in tree_dict.values()
-            ], dtype=np.float32)
-            mean_abs[i] = np.mean(np.abs(vals)) if len(vals) > 0 else 0.0
-
-        raw_w = 1.0 / (mean_abs + 1e-8)
-        self._tree_weights = (raw_w / raw_w.sum()).astype(np.float32)  # (total_trees,)
-
-    # ------------------------------------------------------------------
-    # Macro update  (AWR)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Macro update (AWR)
+    # ------------------------------------------------------------------ #
 
     def train_macro_awr(self, states, actions, advantages, returns):
-        returns_1d  = returns.flatten()
-        advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        weights     = np.clip(np.exp(advantages / self.awr_beta), 0, 20.0).flatten()
-        actions_flat = actions.astype(np.float32).reshape(-1, self.action_dim)
-        N = len(states)
+        """Rebuild both ensembles from the replay buffer with AWR."""
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float64).reshape(-1, self.action_dim)
+        returns = np.asarray(returns, dtype=np.float64).ravel()
+        adv = np.asarray(advantages, dtype=np.float64).ravel()
 
-        # --- Train models ---
-        dtrain_act  = self._prepare_dmatrix(states, label=actions_flat, weight=weights)
-        self.actor_model = xgb.train(self.actor_params, dtrain_act,
-                                     num_boost_round=self.n_estimators)
+        # AWR (Peng et al.) uses A = R - V(s) under the *current* value
+        # function.  The advantages stored in the replay buffer were computed by
+        # whatever critic existed when the sample was collected - up to
+        # `awr_buffer_size` steps ago - so recomputing them here is both cheaper
+        # than it looks and considerably less stale.
+        if self.critic_model is not None:
+            adv = returns - self.predict_value(states)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-        dtrain_crit = self._prepare_dmatrix(states, label=returns_1d, weight=weights)
-        self.critic_model = xgb.train(self.critic_params, dtrain_crit,
-                                      num_boost_round=self.n_estimators)
+        beta = self.awr_beta
+        if self.awr_target_ess is not None:
+            beta = _target_ess_beta(adv, self.awr_target_ess, self.awr_weight_clip)
+        # Subtract the max before exponentiating for numerical stability; the
+        # common factor cancels because XGBoost normalises by the weight sum.
+        weights = np.exp(np.clip(adv / beta, -50.0, 50.0) - np.max(adv / beta))
+        weights = np.clip(weights, 0.0, self.awr_weight_clip)
+        weights = weights / max(weights.mean(), 1e-12)
 
-        X_eval = self._prepare_dmatrix(states)
+        n_est = self.n_estimators
+        d_eval = self._dmatrix(states)
 
-        # ---- CRITIC leaf stats ----
-        dump_crit = self.critic_model.get_dump(with_stats=True, dump_format='json')
-        json_trees_crit = [json.loads(t) for t in dump_crit]
-        self.critic_leaves_per_tree = [get_leafs(t) for t in json_trees_crit]
-
-        leaf_preds_crit = self.critic_model.predict(X_eval, pred_leaf=True).astype(int)  # (N, n_est)
-
-        # Build native critic leaf-weight array so we can reconstruct cumulative
-        # predictions without calling predict(iteration_range=...) n_estimators times.
-        crit_max_lid = max(
-            (max(d.keys()) for d in self.critic_leaves_per_tree if d), default=0
+        # ---- critic: unweighted regression onto the returns ------------------
+        self.critic_model = xgb.train(
+            self.critic_params,
+            self._dmatrix(states, label=returns),
+            num_boost_round=n_est,
         )
-        native_crit = np.zeros((self.n_estimators, crit_max_lid + 1), dtype=np.float32)
-        for i, tree_dict in enumerate(self.critic_leaves_per_tree):
-            for lid, ldata in tree_dict.items():
-                native_crit[i, lid] = ldata.get('leaf', 0.0)
 
-        # gathered_crit[n, i] = native leaf weight for sample n in tree i  -> (N, n_est)
-        gathered_crit = native_crit[np.arange(self.n_estimators), leaf_preds_crit]
+        # ---- actor: AWR-weighted regression onto the actions ------------------
+        if self.shared_tree_structure:
+            self.actor_models = [
+                xgb.train(
+                    self.actor_params,
+                    self._dmatrix(states, label=actions, weight=weights),
+                    num_boost_round=n_est,
+                )
+            ]
+        else:
+            self.actor_models = [
+                xgb.train(
+                    self.actor_params,
+                    self._dmatrix(states, label=actions[:, d], weight=weights),
+                    num_boost_round=n_est,
+                )
+                for d in range(self.action_dim)
+            ]
 
-        # Match original: pred_at tree i = predict(iteration_range=(0, i+1))
-        #   i=0  -> base_score only (XGBoost special-cases first tree)
-        #   i>0  -> base_score + cumsum of trees 0..i  (inclusive)
-        cumsum_crit = np.cumsum(gathered_crit, axis=1)             # (N, n_est)
-        pred_at_crit = np.empty_like(cumsum_crit)
-        pred_at_crit[:, 0]  = self.critic_params['base_score']
-        pred_at_crit[:, 1:] = self.critic_params['base_score'] + cumsum_crit[:, 1:]
-
-        residuals_crit = returns_1d[:, np.newaxis] - pred_at_crit  # (N, n_est)
-
-        for i in range(self.n_estimators):
-            lids  = leaf_preds_crit[:, i].astype(int)
-            res   = residuals_crit[:, i]
-            mlid  = int(lids.max()) + 1
-            cnt   = np.bincount(lids, minlength=mlid).astype(np.float32)
-            s1    = np.bincount(lids, weights=res,      minlength=mlid)
-            s2    = np.bincount(lids, weights=res ** 2, minlength=mlid)
-            # mean and variance only where the leaf has samples
-            safe  = cnt > 0
-            mn    = np.where(safe, s1 / np.where(safe, cnt, 1.0), 0.0)
-            vr    = np.where(cnt > 1,
-                             s2 / np.where(safe, cnt, 1.0) - mn ** 2,
-                             0.0)
-            for lid, d in self.critic_leaves_per_tree[i].items():
-                if lid < mlid and cnt[lid] > 0:
-                    d['leaf_count']    = int(cnt[lid])
-                    d['leaf_mean']     = d.get('leaf_weight', 0.0)
-                    d['leaf_variance'] = float(vr[lid]) * self.critic_lr ** 2
-
-        # ---- ACTOR leaf stats (vectorized residual reconstruction) ----
-        total_trees = self.n_estimators * self.action_dim
-        dump_act  = self.actor_model.get_dump(with_stats=True, dump_format='json')
-        json_trees_act = [json.loads(t) for t in dump_act]
-        self.actor_leaves_per_tree = [get_leafs(t) for t in json_trees_act]
-
-        # pred_leaf → (N, total_trees); each column = leaf id for that dump-tree
-        leaf_preds_act = self.actor_model.predict(X_eval, pred_leaf=True).astype(int)
-
-        # Build native weight lookup from the just-parsed dump trees.
-        # We need this to reconstruct cumulative predictions without calling
-        # model.predict() in a loop (which was the expensive part).
-        tmp_max_lid = max(
-            (max(d.keys()) for d in self.actor_leaves_per_tree if d), default=0
+        # ---- parse dumps and size the dense arrays ---------------------------
+        # multi_output_tree dumps do not support with_stats; we compute our own
+        # counts and variances from the data anyway.
+        actor_dumps = [
+            m.get_dump(with_stats=False, dump_format="json") for m in self.actor_models
+        ]
+        for k, dump in enumerate(actor_dumps):
+            if len(dump) != n_est:
+                raise RuntimeError(
+                    f"actor booster {k} produced {len(dump)} trees, expected "
+                    f"{n_est}. With shared_tree_structure=True this usually "
+                    "means multi_strategy='multi_output_tree' was not applied "
+                    "and XGBoost fell back to one output per tree."
+                )
+        actor_leaves = [[get_leafs(json.loads(t)) for t in d] for d in actor_dumps]
+        max_lid = max(
+            (max(t) for leaves in actor_leaves for t in leaves if t), default=0
         )
-        tmp_native = np.zeros((total_trees, tmp_max_lid + 1), dtype=np.float32)
-        for i, tree_dict in enumerate(self.actor_leaves_per_tree):
-            for lid, ldata in tree_dict.items():
-                tmp_native[i, lid] = ldata.get('leaf', 0.0)
 
-        # Gather native leaf weights for every (sample, tree) → (N, total_trees)
-        tree_idx = np.arange(total_trees)
-        gathered_native = tmp_native[tree_idx, leaf_preds_act]  # (N, total_trees)
-
-        # Reshape to (N, n_estimators, action_dim): axis-2 = dim, axis-1 = round
-        # Tree layout: [dim0_r0, dim1_r0, …, dim(D-1)_r0, dim0_r1, …]
-        # → C-order reshape puts last axis fastest → [b, round, dim]  ✓
-        gathered_3d = gathered_native.reshape(N, self.n_estimators, self.action_dim)
-
-        # The original calls predict(iteration_range=(0, r+1)) for round r > 0,
-        # meaning the prediction *includes* round r (not just up to r-1).
-        # Concretely:
-        #   r = 0  → pred = base_score                   (special-cased)
-        #   r > 0  → pred = base_score + cumsum[0..r]    (inclusive of round r)
-        cumsum_3d = np.cumsum(gathered_3d, axis=1)           # (N, n_est, D)
-        pred_at_3d = np.empty_like(cumsum_3d)
-        pred_at_3d[:, 0, :]  = self.actor_params['base_score']          # r=0: base only
-        pred_at_3d[:, 1:, :] = self.actor_params['base_score'] + cumsum_3d[:, 1:, :]  # r>0
-
-        # residuals_3d[b, r, d] = actions[b, d] - pred_at[b, r, d]
-        residuals_3d = actions_flat[:, np.newaxis, :] - pred_at_3d  # (N, n_est, D)
-
-        # Write stats back into the leaf dicts — pure numpy, no Pandas objects
-        for i in range(total_trees):
-            round_idx = i // self.action_dim
-            dim_idx   = i % self.action_dim
-
-            lids  = leaf_preds_act[:, i].astype(int)
-            res   = residuals_3d[:, round_idx, dim_idx]
-            mlid  = int(lids.max()) + 1
-            cnt   = np.bincount(lids, minlength=mlid).astype(np.float32)
-            s2    = np.bincount(lids, weights=res ** 2, minlength=mlid)
-            s1    = np.bincount(lids, weights=res,      minlength=mlid)
-            safe  = cnt > 0
-            mn    = np.where(safe, s1 / np.where(safe, cnt, 1.0), 0.0)
-            vr    = np.where(cnt > 1,
-                             s2 / np.where(safe, cnt, 1.0) - mn ** 2,
-                             0.0)
-            for lid, d in self.actor_leaves_per_tree[i].items():
-                if lid < mlid and cnt[lid] > 0:
-                    d['leaf_count']    = int(cnt[lid])
-                    # Native XGBoost leaf weight: sum across trees reproduces
-                    # the model prediction in pick_action (same as critic).
-                    d['leaf_mean']     = d.get('leaf', 0.0)
-                    d['leaf_variance'] = float(vr[lid]) * self.actor_lr ** 2
-
-        # Compile dense fast arrays for inference and micro-updates
-        self._build_fast_arrays()
-
-    # ------------------------------------------------------------------
-    # Micro update  (PPO)  — fully vectorized
-    # ------------------------------------------------------------------
-
-    def train_micro_ppo(self, states, actions, old_log_probs, advantages):
-        if self.actor_model is None:
-            return
-
-        advantages   = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        actions_flat = actions.astype(np.float32).reshape(-1, self.action_dim)
-        advantages   = advantages.reshape(-1, 1)
-        N            = len(states)
-        T            = self._total_trees
-
-        # Leaf assignments are fixed for the entire set of epochs: the tree
-        # *structure* never changes between micro-updates, only leaf values do.
-        # Re-using the same assignments is correct and avoids redundant predict calls.
-        leaf_assignments = self.actor_model.predict(
-            self._prepare_dmatrix(states), pred_leaf=True
-        ).astype(int)                                    # (N, T)
-        np.clip(leaf_assignments, 0, self._max_leaf_id,
-                out=leaf_assignments)
-
-        # n_ppo_epochs > 1 is what makes the PPO clip meaningful: on epoch 1
-        # the policy hasn't moved so ratio == 1.0 everywhere and the clip never
-        # fires.  By epoch 2+ the leaf values have shifted and the ratio
-        # genuinely deviates, so the clip correctly gates further updates.
-        # For A2C n_ppo_epochs should always be 1.
-        n_epochs = self.n_ppo_epochs if self.use_ppo_clip else 1
-
-        for _epoch in range(n_epochs):
-
-            # ---- 2. Vectorized mu reconstruction ----
-            # gathered_means[n, t] = fast_leaf_means_arr[t, leaf_assignments[n, t]]
-            tree_idx      = np.arange(T)                     # (T,)
-            gathered      = self.fast_leaf_means_arr[tree_idx, leaf_assignments]  # (N, T)
-            # Sum across rounds for each dim: reshape (N, n_estimators, action_dim)
-            mu = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)  # (N, D)
-            mu += self.actor_params['base_score']
-
-            # ---- 3. Get variance (per-leaf or global) ----
-            if self.obs_dependent_std:
-                gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]
-                var_sum = np.clip(
-                    gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
-                    1e-4, 5.0,
-                )                                                                 # (N, D)
-            else:
-                var_sum = np.broadcast_to(
-                    np.exp(self.log_std) ** 2, (N, self.action_dim)
-                ).copy()                                                           # (N, D)
-
-            # ---- 4. Effective advantages (PPO clip or raw A2C) ----
-            if self.use_ppo_clip:
-                # Recompute log π_new under the current (just-updated) policy.
-                new_log_prob = (
-                    -0.5 * (((actions_flat - mu) ** 2) / var_sum
-                            + np.log(var_sum)
-                            + np.log(2 * np.pi))
-                ).sum(axis=1)                                                     # (N,)
-                ratio = np.exp(new_log_prob - old_log_probs)                      # (N,)
-                # Zero out samples where the policy has already moved outside
-                # [1-ε, 1+ε] in the direction that would push it further out.
-                # This is the exact PPO masking condition.
-                adv_flat = advantages.flatten()
-                clip_mask = ~(
-                    ((ratio > 1.0 + self.clip_ratio) & (adv_flat > 0)) |
-                    ((ratio < 1.0 - self.clip_ratio) & (adv_flat < 0))
-                )                                                                 # (N,)
-                eff_adv = advantages * clip_mask.reshape(-1, 1)                  # (N, D)
-            else:
-                # A2C: use raw (normalised) advantages, no ratio gating
-                eff_adv = advantages                                              # (N, D)
-
-            # ---- 5. Compute gradients ----
-            # Divide by n_epochs so that the total update magnitude per rollout
-            # is ppo_lr * grad regardless of how many epochs are run.
-            # Without this, PPO with n_epochs=4 has 4× the effective learning
-            # rate of A2C, making the two variants not directly comparable.
-            # Mean: ∂log π/∂μ = advantage * (action - μ) / var
-            raw_grad_mu = eff_adv * (actions_flat - mu) / var_sum
-            grad_mu     = np.clip(raw_grad_mu, -10.0, 10.0)
-            step_mu     = (self.ppo_lr / n_epochs) * grad_mu                      # (N, D)
-
-            # Variance: ∂log π/∂var = 0.5 * advantage * ((a-μ)²/var² - 1/var)
-            grad_var = 0.5 * eff_adv * (
-                (actions_flat - mu) ** 2 / var_sum ** 2 - 1.0 / var_sum
+        dump_c = self.critic_model.get_dump(with_stats=False, dump_format="json")
+        if len(dump_c) != n_est:
+            raise RuntimeError(
+                f"critic produced {len(dump_c)} trees, expected {n_est}."
             )
-            step_var = (self.ppo_lr / n_epochs) * grad_var                        # (N, D)
+        critic_leaves = [get_leafs(json.loads(t)) for t in dump_c]
+        max_lid = max(max_lid, max((max(t) for t in critic_leaves if t), default=0))
 
-            # ---- 6. Scatter mean updates via per-tree bincount ----
-            step_mu_per_tree = step_mu[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
+        L = int(max_lid) + 1
+        self._n_leaf_slots = L
+        base = float(self.actor_params["base_score"])
 
-            max_lid_p1 = self._max_leaf_id + 1
-            for t in range(T):
-                lids = leaf_assignments[:, t]
-                mean_update = np.bincount(lids, weights=step_mu_per_tree[:, t],
-                                          minlength=max_lid_p1).astype(np.float32)
-                self.fast_leaf_means_arr[t] += mean_update[:max_lid_p1]
+        # ---- actor leaf means, variances, tree weights -----------------------
+        if self.shared_tree_structure:
+            native = _native_leaf_array_multi(
+                actor_leaves[0], n_est, max_lid, self.action_dim
+            )                                            # (D, n_est, L)
+            shared_ids = self._as_leaf_ids(
+                self.actor_models[0].predict(d_eval, pred_leaf=True), n_est
+            )
+            if shared_ids.shape[1] != n_est:
+                raise RuntimeError(
+                    f"pred_leaf returned {shared_ids.shape[1]} columns, expected "
+                    f"{n_est}: the tree structure is not shared across outputs."
+                )
+            leaf_ids_per_dim = [shared_ids] * self.action_dim
+        else:
+            native = np.stack([
+                _native_leaf_array(actor_leaves[d], n_est, max_lid)
+                for d in range(self.action_dim)
+            ])                                           # (D, n_est, L)
+            leaf_ids_per_dim = [
+                self._as_leaf_ids(m.predict(d_eval, pred_leaf=True), n_est)
+                for m in self.actor_models
+            ]
 
-            # ---- 7. Variance update (per-leaf or global) ----
-            if self.obs_dependent_std:
-                step_var_per_tree = step_var[:, self._dim_indices] * self._tree_weights[np.newaxis, :]
-                for t in range(T):
-                    lids = leaf_assignments[:, t]
-                    var_update = np.bincount(lids, weights=step_var_per_tree[:, t],
-                                             minlength=max_lid_p1).astype(np.float32)
-                    self.fast_leaf_vars_arr[t] += var_update[:max_lid_p1]
-                np.maximum(self.fast_leaf_vars_arr, 1e-4, out=self.fast_leaf_vars_arr)
-            else:
-                # Single global log_std update: average gradient across batch
-                grad_log_std      = eff_adv * (((actions_flat - mu) ** 2) / var_sum - 1.0)
-                mean_grad_log_std = np.clip(grad_log_std.mean(axis=0), -0.5, 0.5)
-                self.log_std     += self.ppo_lr * mean_grad_log_std
-                self.log_std      = np.maximum(self.log_std, -2.0)
+        self.actor_leaf_means = np.zeros((self.action_dim, n_est, L))
+        self.actor_leaf_vars = (
+            np.ones((self.action_dim, n_est, L)) * self.var_min[:, None, None]
+        )
+        self.actor_tree_weights = np.zeros((self.action_dim, n_est))
 
-        # ------------------------------------------------------------------
-        # Inference — fully vectorized
-        # ------------------------------------------------------------------
+        if self.verify_reconstruction:
+            ref = np.asarray(
+                self.actor_models[0].predict(d_eval), dtype=np.float64
+            ).reshape(len(states), -1) if self.shared_tree_structure else np.stack(
+                [np.asarray(m.predict(d_eval), dtype=np.float64)
+                 for m in self.actor_models], axis=1
+            )
+            if ref.shape[1] != self.action_dim:
+                raise RuntimeError(
+                    f"actor predict returned {ref.shape[1]} outputs, expected "
+                    f"{self.action_dim}."
+                )
 
-    def pick_action(self, obs):
-        if self.actor_model is None:
-            acts      = np.random.uniform(self.action_low, self.action_high,
-                                          size=(len(obs), self.action_dim))
-            log_probs = np.full(len(obs), np.sum(-np.log(self.action_high - self.action_low)))
-            return acts, acts, log_probs
+        rounds = np.arange(n_est)
+        for d in range(self.action_dim):
+            leaf_ids = leaf_ids_per_dim[d]
+            pred = base + native[d][rounds, leaf_ids].sum(axis=1)
+            if self.verify_reconstruction:
+                err = np.max(np.abs(pred - ref[:, d]))
+                if err > 1e-3 * max(1.0, np.max(np.abs(ref[:, d]))):
+                    raise RuntimeError(
+                        f"actor dim {d} leaf reconstruction mismatch "
+                        f"(max err {err:.3e}); the dump layout does not match "
+                        "the assumed one."
+                    )
 
-        N = len(obs)
-        T = self._total_trees
+            residual = actions[:, d] - pred
+            cnt, _, var = _leaf_stats(leaf_ids, residual, n_est, L)
 
-        leaf_assignments = self.actor_model.predict(
-            self._prepare_dmatrix(obs), pred_leaf=True
-        ).astype(int)                                    # (N, T)
-        np.clip(leaf_assignments, 0, self._max_leaf_id,
-                out=leaf_assignments)
+            self.actor_leaf_means[d] = native[d]
+            # Per-leaf conditional variance of the residual.  Averaged (not
+            # summed) across rounds in `_forward`: each round is a different
+            # partition of the same residual, so the rounds are estimates of the
+            # same quantity, not independent contributions.
+            self.actor_leaf_vars[d] = np.where(
+                cnt > 1, np.maximum(var, self.var_min[d]), self.var_min[d]
+            )
+            self.actor_tree_weights[d] = _inverse_magnitude_weights(native[d], cnt)
 
-        tree_idx = np.arange(T)
-        gathered = self.fast_leaf_means_arr[tree_idx, leaf_assignments]  # (N, T)
-        mu       = gathered.reshape(N, self.n_estimators, self.action_dim).sum(axis=1)
-        mu      += self.actor_params['base_score']       # (N, D)
+        # ---- critic leaf means / tree weights --------------------------------
+        native_c = _native_leaf_array(critic_leaves, n_est, max_lid)
+        leaf_ids_c = self._as_leaf_ids(
+            self.critic_model.predict(d_eval, pred_leaf=True), n_est
+        )
+        pred_c = float(self.critic_params["base_score"]) + native_c[
+            np.arange(n_est), leaf_ids_c
+        ].sum(axis=1)
+        if self.verify_reconstruction:
+            ref_c = self.critic_model.predict(d_eval).astype(np.float64)
+            err = np.max(np.abs(pred_c - ref_c))
+            if err > 1e-3 * max(1.0, np.max(np.abs(ref_c))):
+                raise RuntimeError(
+                    f"critic leaf reconstruction mismatch (max err {err:.3e})."
+                )
+        cnt_c, _, _ = _leaf_stats(leaf_ids_c, returns - pred_c, n_est, L)
+        self.critic_leaf_means = native_c
+        self.critic_tree_weights = _inverse_magnitude_weights(native_c, cnt_c)
+
+        # Adam moments are tied to the leaf partition, which has just changed.
+        self._adam_mu = _LeafAdam(self.actor_leaf_means.shape)
+        self._adam_var = _LeafAdam(self.actor_leaf_vars.shape)
+        self._adam_v = _LeafAdam(self.critic_leaf_means.shape)
+        self._return_scale = float(returns.std() + 1e-8)
+
+        self.last_diagnostics["awr/mu_outside_box"] = float(
+            np.mean(
+                (self.predict(states[:2000]) != self._forward(
+                    self._leaf_ids(states[:2000])[0])[0]).any(axis=1)
+            )
+        )
+        self.last_diagnostics["awr/beta"] = float(beta)
+        self.last_diagnostics["awr/weight_mean"] = float(weights.mean())
+        self.last_diagnostics["awr/weight_max"] = float(weights.max())
+        self.last_diagnostics["awr/effective_sample_frac"] = float(
+            weights.sum() ** 2 / (len(weights) * (weights ** 2).sum() + 1e-12)
+        )
+        self.last_diagnostics["awr/n_samples"] = int(len(states))
+
+    # ------------------------------------------------------------------ #
+    # Forward pass
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _as_leaf_ids(raw, n_est):
+        return np.atleast_2d(raw).astype(np.int64).reshape(-1, n_est)
+
+    def _leaf_ids(self, states):
+        """Per-dimension leaf assignments, (N, n_estimators) each.
+
+        In shared mode all dimensions index the *same* tree structure, so one
+        `pred_leaf` call is made and the resulting array is reused for every
+        dimension.  Everything downstream is agnostic to which mode is active.
+        """
+        d = self._dmatrix(states)
+        n_est = self.n_estimators
+
+        if self.shared_tree_structure:
+            shared = self._as_leaf_ids(
+                self.actor_models[0].predict(d, pred_leaf=True), n_est
+            )
+            np.clip(shared, 0, self._n_leaf_slots - 1, out=shared)
+            actor_ids = [shared] * self.action_dim
+        else:
+            actor_ids = [
+                self._as_leaf_ids(m.predict(d, pred_leaf=True), n_est)
+                for m in self.actor_models
+            ]
+            for a in actor_ids:
+                np.clip(a, 0, self._n_leaf_slots - 1, out=a)
+
+        critic_ids = self._as_leaf_ids(
+            self.critic_model.predict(d, pred_leaf=True), n_est
+        )
+        np.clip(critic_ids, 0, self._n_leaf_slots - 1, out=critic_ids)
+        return actor_ids, critic_ids
+
+    def _forward(self, actor_ids):
+        """mu (N, D) and var (N, D) from cached leaf assignments."""
+        n_est = self.n_estimators
+        rounds = np.arange(n_est)
+        n = actor_ids[0].shape[0]
+
+        mu = np.empty((n, self.action_dim))
+        for d in range(self.action_dim):
+            mu[:, d] = self.actor_leaf_means[d][rounds, actor_ids[d]].sum(axis=1)
+        mu += float(self.actor_params["base_score"])
 
         if self.obs_dependent_std:
-            # Sum per-tree aleatoric variances → different exploration width
-            # per observation region.
-            gathered_vars = self.fast_leaf_vars_arr[tree_idx, leaf_assignments]
-            var = np.clip(
-                gathered_vars.reshape(N, self.n_estimators, self.action_dim).sum(axis=1),
-                1e-4, 5.0,
-            )                                            # (N, D)
+            var = np.empty((n, self.action_dim))
+            for d in range(self.action_dim):
+                var[:, d] = self.actor_leaf_vars[d][rounds, actor_ids[d]].mean(axis=1)
+            np.clip(var, self.var_min[None, :], self.var_max[None, :], out=var)
         else:
-            # Single global variance shared across all observations.
             var = np.broadcast_to(
-                np.exp(self.log_std) ** 2, (N, self.action_dim)
+                np.exp(2.0 * self.log_std), (n, self.action_dim)
             ).copy()
-        std = np.sqrt(var)
+        return mu, var
 
-        raw_actions = np.random.normal(loc=mu, scale=std)
-        log_probs   = (
-            -0.5 * (((raw_actions - mu) ** 2) / var
-                    + np.log(var)
-                    + np.log(2 * np.pi))
-        ).sum(axis=1)                                    # (N,)
+    def _value(self, critic_ids):
+        rounds = np.arange(self.n_estimators)
+        return (
+            float(self.critic_params["base_score"])
+            + self.critic_leaf_means[rounds, critic_ids].sum(axis=1)
+        )
 
-        actions = np.clip(raw_actions, self.action_low, self.action_high)
-        return actions, raw_actions, log_probs
+    @staticmethod
+    def _log_prob(actions, mu, var):
+        return (
+            -0.5 * (((actions - mu) ** 2) / var + np.log(var) + np.log(2.0 * np.pi))
+        ).sum(axis=1)
+
+    # ------------------------------------------------------------------ #
+    # Inference
+    # ------------------------------------------------------------------ #
+
+    def pick_action(self, obs):
+        """Sample an action.  Returns (clipped, raw, log_prob)."""
+        obs = np.asarray(obs, dtype=np.float32)
+        n = len(obs)
+
+        if self.actor_models is None:
+            raw = np.random.uniform(
+                self.action_low, self.action_high, size=(n, self.action_dim)
+            )
+            lp = np.full(n, -np.sum(np.log(self.action_high - self.action_low)))
+            return np.clip(raw, self.action_low, self.action_high), raw, lp
+
+        actor_ids, _ = self._leaf_ids(obs)
+        mu, var = self._forward(actor_ids)
+        raw = np.random.normal(loc=mu, scale=np.sqrt(var))
+        lp = self._log_prob(raw, mu, var)
+        return np.clip(raw, self.action_low, self.action_high), raw, lp
+
+    def predict(self, obs, deterministic=True):
+        """Greedy (mean) action, for evaluation."""
+        obs = np.asarray(obs, dtype=np.float32)
+        if obs.ndim == 1:
+            obs = obs[None, :]
+        if self.actor_models is None:
+            return np.clip(
+                np.random.uniform(self.action_low, self.action_high,
+                                  size=(len(obs), self.action_dim)),
+                self.action_low, self.action_high,
+            )
+        if not deterministic:
+            return self.pick_action(obs)[0]
+        actor_ids, _ = self._leaf_ids(obs)
+        mu, _ = self._forward(actor_ids)
+        return np.clip(mu, self.action_low, self.action_high)
 
     def predict_value(self, obs):
         if self.critic_model is None:
             return np.zeros(len(obs))
-        return self.critic_model.predict(self._prepare_dmatrix(obs))
+        _, critic_ids = self._leaf_ids(np.asarray(obs, dtype=np.float32))
+        return self._value(critic_ids)
+
+    # ------------------------------------------------------------------ #
+    # Micro update (A2C / PPO leaf-value refit) + critic leaf refit
+    # ------------------------------------------------------------------ #
+
+    def train_micro(self, states, actions, old_log_probs, advantages, returns):
+        if self.actor_models is None or self._adam_mu is None:
+            return {}
+
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float64).reshape(-1, self.action_dim)
+        old_lp = np.asarray(old_log_probs, dtype=np.float64).ravel()
+        adv = np.asarray(advantages, dtype=np.float64).ravel()
+        returns = np.asarray(returns, dtype=np.float64).ravel()
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        n, n_est, L = len(states), self.n_estimators, self._n_leaf_slots
+        # Keep the total step size epoch-invariant.
+        lr_scale = 1.0 / self.n_ppo_epochs
+
+        # Tree *structure* is frozen between macro-updates, so leaf assignments
+        # can be computed once and reused across epochs.
+        actor_ids, critic_ids = self._leaf_ids(states)
+        mu_before, _ = self._forward(actor_ids)
+
+        clip_frac, kl, epochs_run = 0.0, 0.0, 0
+        for _epoch in range(self.n_ppo_epochs):
+            epochs_run += 1
+            mu, var = self._forward(actor_ids)
+
+            if self.use_ppo_clip:
+                new_lp = self._log_prob(actions, mu, var)
+                ratio = np.exp(np.clip(new_lp - old_lp, -20.0, 20.0))
+                kl = float(np.mean(old_lp - new_lp))
+                # Real clipped surrogate: grad L = ratio * A * dlog pi where the
+                # clip does not bind, 0 where it does.
+                binding = ((ratio > 1.0 + self.clip_ratio) & (adv > 0)) | (
+                    (ratio < 1.0 - self.clip_ratio) & (adv < 0)
+                )
+                clip_frac = float(binding.mean())
+                eff = ratio * adv * (~binding)
+                if self.target_kl is not None and kl > self.target_kl:
+                    break
+            else:
+                eff = adv                                     # A2C
+            eff2d = eff[:, None]
+
+            grad_mu = np.clip(
+                eff2d * (actions - mu) / var, -self.grad_clip, self.grad_clip
+            )
+            grad_var = 0.5 * eff2d * (
+                ((actions - mu) ** 2) / var ** 2 - 1.0 / var
+            )
+            if self.ent_coef:
+                grad_var = grad_var + self.ent_coef * 0.5 / var
+            grad_var = np.clip(grad_var, -self.grad_clip, self.grad_clip)
+
+            # Aggregate raw per-leaf gradients, Adam-normalise them, then apply
+            # the tree weights (which sum to 1) so the *ensemble output* moves by
+            # about `mu_step` per micro-update regardless of gradient scale.
+            g_mu = np.stack([
+                _scatter_leaf_update(
+                    actor_ids[d], grad_mu[:, d], np.ones(n_est),
+                    n_est, L, self.leaf_update_norm,
+                )
+                for d in range(self.action_dim)
+            ])
+            u_mu = self._adam_mu.step(g_mu)
+            for d in range(self.action_dim):
+                # mu = sum_r m[r]
+                self.actor_leaf_means[d] += (
+                    (lr_scale * self.mu_step[d])
+                    * self.actor_tree_weights[d][:, None] * u_mu[d]
+                )
+
+            if self.obs_dependent_std:
+                g_var = np.stack([
+                    _scatter_leaf_update(
+                        actor_ids[d], grad_var[:, d], np.ones(n_est),
+                        n_est, L, self.leaf_update_norm,
+                    )
+                    for d in range(self.action_dim)
+                ])
+                u_var = self._adam_var.step(g_var)
+                # var = mean_r v[r]  ->  a uniform delta on every round moves the
+                # aggregate by exactly that delta.
+                var_step = lr_scale * self.ppo_lr * (self.var_max - self.var_min)
+                self.actor_leaf_vars += var_step[:, None, None] * u_var
+            if self.obs_dependent_std:
+                np.clip(self.actor_leaf_vars,
+                        self.var_min[:, None, None], self.var_max[:, None, None],
+                        out=self.actor_leaf_vars)
+            else:
+                g = np.clip(
+                    (eff2d * (((actions - mu) ** 2) / var - 1.0)).mean(axis=0),
+                    -0.5, 0.5,
+                )
+                # log-space step, so a plain lr is the right scale here
+                self.log_std = np.clip(
+                    self.log_std + lr_scale * self.ppo_lr * g,
+                    0.5 * np.log(self.var_min), 0.5 * np.log(self.var_max),
+                )  # bounds are per-dimension arrays
+
+        # ---- critic leaf refit (Algorithm 1 line 9) --------------------------
+        v_before = self._value(critic_ids)
+        td_error = returns - v_before
+        g_v = _scatter_leaf_update(
+            critic_ids, td_error, np.ones(n_est), n_est, L, self.leaf_update_norm,
+        )
+        self.critic_leaf_means += (
+            (self.critic_lr * self._return_scale)
+            * self.critic_tree_weights[:, None] * self._adam_v.step(g_v)
+        )
+        v_after = self._value(critic_ids)
+
+        var_ret = float(np.var(returns))
+        diag = {
+            "train/micro_epochs": epochs_run,
+            "train/clip_fraction": clip_frac,
+            "train/approx_kl": kl,
+            "train/micro_mu_delta": float(
+                np.abs(self._forward(actor_ids)[0] - mu_before).mean()
+            ),
+            "train/critic_lr_step": float(np.abs(v_after - v_before).mean()),
+            "train/value_loss": float(np.mean(td_error ** 2)),
+            "train/explained_variance": float(
+                1.0 - np.var(returns - v_after) / (var_ret + 1e-12)
+            ) if var_ret > 0 else 0.0,
+        }
+        mu, var = self._forward(actor_ids)
+        for d in range(self.action_dim):
+            diag[f"policy/std_dim{d}"] = float(np.sqrt(var[:, d]).mean())
+            diag[f"policy/mu_dim{d}"] = float(mu[:, d].mean())
+            diag[f"policy/var_at_ceiling_dim{d}"] = float(
+                np.mean(var[:, d] >= self.var_max[d] - 1e-9)
+            )
+        self.last_diagnostics.update(diag)
+        return diag
+
+    # Backwards-compatible alias.
+    def train_micro_ppo(self, states, actions, old_log_probs, advantages, returns):
+        return self.train_micro(states, actions, old_log_probs, advantages, returns)
 
 
-# ---------------------------------------------------------------------------
-# SB3-Compatible Wrapper
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# SB3-compatible wrapper
+# --------------------------------------------------------------------------- #
 
 class Hybrid_XGB:
-    """SB3-compatible training loop."""
+    """Training loop: rollout -> micro-update -> periodic AWR macro-update."""
 
-    def __init__(self, env, awr_update_freq=10000, awr_buffer_size=15000,
-                 n_steps=256, gamma=0.99, gae_lambda=0.95, ppo_lr=0.01,
-                 awr_beta=0.5, max_depth=6, n_estimators=500,
-                 use_ppo_clip=False, obs_dependent_std=True,
-                 n_ppo_epochs=4, **kwargs):
-        self.env      = env
-        self.n_envs   = env.num_envs
-        self.n_steps  = n_steps
-        self.awr_update_freq = awr_update_freq
-        self.gamma       = gamma
-        self.gae_lambda  = gae_lambda
+    def __init__(
+        self,
+        env,
+        awr_update_freq: int = 10000,
+        awr_buffer_size: int = 15000,
+        awr_min_samples: int = 500,
+        n_steps: int = 256,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        ppo_lr: float = 0.03,
+        critic_lr: float = 0.03,
+        awr_beta: float = 0.5,
+        awr_target_ess: float | None = 0.3,
+        max_depth: int = 6,
+        n_estimators: int = 300,
+        actor_eta: float = 0.05,
+        critic_eta: float = 0.05,
+        use_ppo_clip: bool = False,
+        obs_dependent_std: bool = True,
+        n_ppo_epochs: int = 4,
+        ent_coef: float = 0.0,
+        target_kl: float | None = None,
+        leaf_update_norm: str = "leaf_mean",
+        shared_tree_structure: bool = True,
+        verify_reconstruction: bool = True,
+        **kwargs,
+    ):
+        self.env = env
+        self.n_envs = getattr(env, "num_envs", 1)
+        self.n_steps = int(n_steps)
+        self.awr_update_freq = int(awr_update_freq)
+        self.awr_min_samples = int(awr_min_samples)
+        self.gamma = float(gamma)
+        self.gae_lambda = float(gae_lambda)
 
-        self.action_dim = (
-            env.action_space.n
-            if hasattr(env.action_space, 'n')
-            else env.action_space.shape[0]
-        )
-
-        if hasattr(env.action_space, 'low'):
-            self.action_low  = env.action_space.low
-            self.action_high = env.action_space.high
-        else:
-            self.action_low  = np.full(self.action_dim, -1.0)
-            self.action_high = np.full(self.action_dim, 1.0)
-
-        self.obs_dim   = env.observation_space.shape
-        self.obs_dtype = object
+        if hasattr(env.action_space, "n"):
+            raise NotImplementedError(
+                "Hybrid_XGB models a diagonal Gaussian policy and supports "
+                "Box action spaces only."
+            )
+        self.action_dim = int(env.action_space.shape[0])
+        self.action_low = np.asarray(env.action_space.low, dtype=np.float64)
+        self.action_high = np.asarray(env.action_space.high, dtype=np.float64)
+        self.obs_dim = tuple(env.observation_space.shape)
 
         self.engine = XGBoostTreeEngine(
             self.action_dim, max_depth, n_estimators, ppo_lr, awr_beta,
@@ -533,163 +898,418 @@ class Hybrid_XGB:
             use_ppo_clip=use_ppo_clip,
             obs_dependent_std=obs_dependent_std,
             n_ppo_epochs=n_ppo_epochs,
+            critic_lr=critic_lr,
+            ent_coef=ent_coef,
+            leaf_update_norm=leaf_update_norm,
+            awr_target_ess=awr_target_ess,
+            actor_eta=actor_eta,
+            critic_eta=critic_eta,
+            target_kl=target_kl,
+            shared_tree_structure=shared_tree_structure,
+            verify_reconstruction=verify_reconstruction,
         )
 
-        self.rollout_buffer = RolloutBuffer(
-            n_steps, env.observation_space, env.action_space,
-            device='cpu', gamma=gamma, gae_lambda=gae_lambda, n_envs=self.n_envs,
-        )
+        try:
+            from stable_baselines3.common.buffers import RolloutBuffer
 
-        # Separate obs buffer (dtype=object for XGBoost; SB3 gets zeros)
-        self.ppo_obs_buffer = np.empty(
-            (n_steps, self.n_envs) + self.obs_dim, dtype=object
-        )
+            self.rollout_buffer = RolloutBuffer(
+                self.n_steps, env.observation_space, env.action_space,
+                device="cpu", gamma=gamma, gae_lambda=gae_lambda, n_envs=self.n_envs,
+            )
+            self._sb3 = True
+        except Exception:
+            self.rollout_buffer = _SimpleRolloutBuffer(
+                self.n_steps, self.obs_dim, self.action_dim,
+                self.n_envs, gamma, gae_lambda,
+            )
+            self._sb3 = False
 
+        # NOTE: the AWR target is the *executed* (clipped) action.  Regressing
+        # on the raw Gaussian sample lets the policy mean drift outside the
+        # action box, where every sample clips to the same executed action and
+        # the gradient signal disappears.
         self.awr_buffer = {
-            'obs':        np.empty((awr_buffer_size,) + self.obs_dim, dtype=object),
-            'actions':    np.zeros((awr_buffer_size, self.action_dim), dtype=np.float32),
-            'returns':    np.zeros(awr_buffer_size, dtype=np.float32),
-            'advantages': np.zeros(awr_buffer_size, dtype=np.float32),
-            'ptr': 0, 'size': 0, 'max_size': awr_buffer_size,
+            "obs": np.zeros((awr_buffer_size,) + self.obs_dim, dtype=np.float32),
+            "actions": np.zeros((awr_buffer_size, self.action_dim), dtype=np.float32),
+            "returns": np.zeros(awr_buffer_size, dtype=np.float32),
+            "advantages": np.zeros(awr_buffer_size, dtype=np.float32),
+            "ptr": 0, "size": 0, "max_size": int(awr_buffer_size),
         }
-        self.num_timesteps = 0
 
-        self.tensorboard_log = kwargs.get('tensorboard_log', None)
-        self.verbose         = kwargs.get('verbose', 1)
-        self.logger          = None
-        self.ep_info_buffer  = deque(maxlen=5)
+        # Executed (clipped) actions, kept alongside the raw Gaussian samples
+        # that the rollout buffer stores for the PPO ratio.
+        self._clipped_actions = np.zeros(
+            (self.n_steps, self.n_envs, self.action_dim), dtype=np.float32
+        )
+        self.num_timesteps = 0
+        self._steps_since_awr = 0
+        self.tensorboard_log = kwargs.get("tensorboard_log", None)
+        self.verbose = kwargs.get("verbose", 1)
+        self.logger = None
+        self.ep_info_buffer = deque(maxlen=100)
 
     def set_logger(self, logger):
         self.logger = logger
 
-    # ------------------------------------------------------------------
-    # Vectorized ring-buffer write
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
-    def _store_in_awr_buffer(self, flat_obs, flat_actions, flat_returns, flat_advantages):
-        """Write a batch into the ring buffer without a Python loop."""
-        n   = len(flat_obs)
+    def _store_in_awr_buffer(self, obs, actions, returns, advantages):
+        n, buf = len(obs), self.awr_buffer
+        cap = buf["max_size"]
+        idx = (np.arange(n) + buf["ptr"]) % cap
+        buf["obs"][idx] = obs
+        buf["actions"][idx] = actions
+        buf["returns"][idx] = returns
+        buf["advantages"][idx] = advantages
+        buf["ptr"] = int((buf["ptr"] + n) % cap)
+        buf["size"] = min(buf["size"] + n, cap)
+
+    def _awr_view(self):
+        """Valid samples in insertion order (handles ring-buffer wraparound)."""
         buf = self.awr_buffer
-        cap = buf['max_size']
+        idx = np.arange(buf["ptr"] - buf["size"], buf["ptr"]) % buf["max_size"]
+        return (buf["obs"][idx], buf["actions"][idx],
+                buf["advantages"][idx], buf["returns"][idx])
 
-        indices = (np.arange(n) + buf['ptr']) % cap
-
-        buf['obs'][indices]        = flat_obs
-        buf['actions'][indices]    = flat_actions
-        buf['returns'][indices]    = flat_returns
-        buf['advantages'][indices] = flat_advantages
-
-        buf['ptr']  = int((buf['ptr'] + n) % cap)
-        buf['size'] = min(buf['size'] + n, cap)
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     def learn(self, total_timesteps, callback=None, log_interval=1,
-              tb_log_name="HYBRID_XGB", **kwargs):
-
-        if self.logger is None:
+              tb_log_name="TERL_XGB", **kwargs):
+        if self.logger is None and self._sb3:
             from stable_baselines3.common.utils import configure_logger
+
             self.logger = configure_logger(
                 self.verbose, self.tensorboard_log, tb_log_name,
                 reset_num_timesteps=True,
             )
 
-        obs            = self.env.reset()
+        obs = self.env.reset()
+        if isinstance(obs, tuple):
+            obs = obs[0]
+        obs = np.asarray(obs, dtype=np.float32)
         episode_starts = np.ones(self.n_envs, dtype=bool)
-        iteration      = 0
-        start_time     = time.time()
+        iteration, start_time = 0, time.time()
 
-        print("🚀 Starting Hybrid XGBoost Training Loop...")
+        if self.verbose:
+            print("Starting TERL / XGBoost training loop...")
 
         while self.num_timesteps < total_timesteps:
             self.rollout_buffer.reset()
             iteration += 1
 
-            # --- 1. COLLECT ---
-            for step in range(self.n_steps):
+            # ---- 1. collect ------------------------------------------------
+            for _step in range(self.n_steps):
                 actions, raw_actions, log_probs = self.engine.pick_action(obs)
+                self._clipped_actions[_step] = actions
                 values = self.engine.predict_value(obs)
                 next_obs, rewards, dones, infos = self.env.step(actions)
+                next_obs = np.asarray(next_obs, dtype=np.float32)
+                rewards = np.asarray(rewards, dtype=np.float32).copy()
 
-                for info in infos:
-                    if 'episode' in info:
-                        self.ep_info_buffer.append(info['episode'])
+                for i, info in enumerate(infos):
+                    if "episode" in info:
+                        self.ep_info_buffer.append(info["episode"])
+                    # Bootstrap value for time-limit truncations, as SB3's PPO
+                    # does; without this GAE treats a truncation as terminal.
+                    if (
+                        dones[i]
+                        and info.get("TimeLimit.truncated", False)
+                        and "terminal_observation" in info
+                    ):
+                        term_obs = np.asarray(
+                            info["terminal_observation"], dtype=np.float32
+                        )[None, :]
+                        rewards[i] += self.gamma * float(
+                            self.engine.predict_value(term_obs)[0]
+                        )
 
-                self.ppo_obs_buffer[step] = obs
-
-                # SB3 buffer receives zero obs (used only for return/advantage math)
-                dummy_obs = np.zeros_like(obs, dtype=np.float32)
-                self.rollout_buffer.add(
-                    dummy_obs, raw_actions, rewards, episode_starts,
-                    th.tensor(values), th.tensor(log_probs),
+                self._add_to_buffer(
+                    obs, raw_actions, rewards, episode_starts, values, log_probs
                 )
 
-                obs            = next_obs
-                episode_starts = dones
+                obs = next_obs
+                episode_starts = np.asarray(dones, dtype=bool)
                 self.num_timesteps += self.n_envs
+                self._steps_since_awr += self.n_envs
 
-            # --- 2. MICRO-UPDATE (PPO) ---
+            # ---- 2. returns / advantages -----------------------------------
             last_values = self.engine.predict_value(obs)
-            self.rollout_buffer.compute_returns_and_advantage(
-                last_values=th.tensor(last_values), dones=dones,
+            self._compute_returns(last_values, episode_starts)
+
+            flat_obs = self._flat("observations", self.obs_dim)
+            flat_actions = self._flat("actions", (self.action_dim,))
+            flat_old_lp = self._flat("log_probs", ())
+            flat_returns = self._flat("returns", ())
+            flat_adv = self._flat("advantages", ())
+
+            # The AWR target is the executed action.  Regressing on the raw
+            # Gaussian sample biases the fit outward: samples beyond the box all
+            # execute as the same boundary action, so the regression is pulled
+            # toward a mean that no longer corresponds to any behaviour, and the
+            # policy drifts into a region where every action clips identically
+            # and the gradient signal vanishes.
+            flat_exec = self._clipped_actions.reshape(-1, self.action_dim)
+            self._store_in_awr_buffer(
+                flat_obs, flat_exec, flat_returns, flat_adv
             )
 
-            flat_obs        = self.ppo_obs_buffer.reshape(-1, *self.obs_dim)
-            flat_actions    = self.rollout_buffer.actions.reshape(-1, self.action_dim)
-            flat_old_lp     = self.rollout_buffer.log_probs.reshape(-1)
-            flat_returns    = self.rollout_buffer.returns.reshape(-1)
-            flat_advantages = self.rollout_buffer.advantages.reshape(-1)
+            # ---- 3. micro-update (A2C / PPO leaves + critic leaves) ---------
+            self.last_diagnostics = diag = self.engine.train_micro(
+                flat_obs, flat_actions, flat_old_lp, flat_adv, flat_returns
+            ) or {}
 
-            self._store_in_awr_buffer(flat_obs, flat_actions, flat_returns, flat_advantages)
-            self.engine.train_micro_ppo(flat_obs, flat_actions, flat_old_lp, flat_advantages)
-
-            # --- 3. MACRO-UPDATE (AWR) ---
-            if (self.num_timesteps % self.awr_update_freq) < (self.n_envs * self.n_steps):
-                valid_size = self.awr_buffer['size']
-                if valid_size > 500:
-                    # Read all valid samples in insertion order using ring-buffer
-                    # index arithmetic. Once the buffer is full ptr wraps around,
-                    # so a plain [:valid_size] slice would silently return samples
-                    # in array order rather than recency order.
-                    # arange(ptr - n, ptr) % cap always yields the correct slots:
-                    # before wrap-around this is identical to [:valid_size];
-                    # after wrap-around it correctly spans the seam.
-                    cap = self.awr_buffer['max_size']
-                    ptr = self.awr_buffer['ptr']
-                    idx = np.arange(ptr - valid_size, ptr) % cap
-                    print(f"🌲 [Timestep {self.num_timesteps}] "
-                          f"Triggering AWR Macro-Update ({valid_size} samples)...")
-                    self.engine.train_macro_awr(
-                        self.awr_buffer['obs'][idx],
-                        self.awr_buffer['actions'][idx],
-                        self.awr_buffer['advantages'][idx],
-                        self.awr_buffer['returns'][idx],
+            # ---- 4. macro-update (AWR rebuild) -----------------------------
+            if (
+                self._steps_since_awr >= self.awr_update_freq
+                and self.awr_buffer["size"] > self.awr_min_samples
+            ):
+                self._steps_since_awr = 0
+                if self.verbose:
+                    print(
+                        f"[t={self.num_timesteps}] AWR macro-update "
+                        f"({self.awr_buffer['size']} samples)"
                     )
+                b_obs, b_act, b_adv, b_ret = self._awr_view()
+                # Measure the macro-update on the same scale as the micro-update:
+                # mean |change in the policy mean| over a fixed probe batch.
+                probe = b_obs[np.linspace(0, len(b_obs) - 1, min(512, len(b_obs)),
+                                          dtype=int)]
+                mu_before = (
+                    self.engine.predict(probe, deterministic=True)
+                    if self.engine.actor_models is not None else None
+                )
+                self.engine.train_macro_awr(b_obs, b_act, b_adv, b_ret)
+                if mu_before is not None:
+                    mu_after = self.engine.predict(probe, deterministic=True)
+                    diag["train/macro_mu_delta"] = float(
+                        np.abs(mu_after - mu_before).mean()
+                    )
+                    self.engine.last_diagnostics.update(diag)
 
-            # --- 4. LOGGING ---
+            # ---- 5. logging -------------------------------------------------
             if self.logger and iteration % log_interval == 0:
-                fps = int(self.num_timesteps / (time.time() - start_time))
-                self.logger.record('time/iterations',     iteration)
-                self.logger.record('time/fps',            fps)
-                self.logger.record('time/time_elapsed',   int(time.time() - start_time))
-                self.logger.record('time/total_timesteps',self.num_timesteps)
-
-                if self.engine.actor_model is not None:
-                    self.logger.record('trees/actor_count',
-                                       self.engine.n_estimators * self.action_dim)
-                    self.logger.record('trees/critic_count', self.engine.n_estimators)
-                else:
-                    self.logger.record('trees/actor_count',  0)
-                    self.logger.record('trees/critic_count', 0)
-
+                elapsed = max(time.time() - start_time, 1e-9)
+                self.logger.record("time/iterations", iteration)
+                self.logger.record("time/fps", int(self.num_timesteps / elapsed))
+                self.logger.record("time/total_timesteps", self.num_timesteps)
+                self.logger.record(
+                    "trees/actor_count",
+                    (self.engine.n_estimators
+                     if self.engine.shared_tree_structure
+                     else self.engine.n_estimators * self.action_dim)
+                    if self.engine.actor_models else 0,
+                )
+                self.logger.record(
+                    "trees/critic_count",
+                    self.engine.n_estimators if self.engine.critic_model else 0,
+                )
+                for k, v in {**self.engine.last_diagnostics, **diag}.items():
+                    self.logger.record(k, v)
                 if self.ep_info_buffer:
-                    self.logger.record('rollout/ep_rew_mean',
-                                       np.mean([ep['r'] for ep in self.ep_info_buffer]))
-                    self.logger.record('rollout/ep_len_mean',
-                                       np.mean([ep['l'] for ep in self.ep_info_buffer]))
-
+                    self.logger.record(
+                        "rollout/ep_rew_mean",
+                        float(np.mean([e["r"] for e in self.ep_info_buffer])),
+                    )
+                    self.logger.record(
+                        "rollout/ep_len_mean",
+                        float(np.mean([e["l"] for e in self.ep_info_buffer])),
+                    )
                 self.logger.dump(step=self.num_timesteps)
 
         return self
+
+    # ------------------------------------------------------------------ #
+
+    def _add_to_buffer(self, obs, raw_actions, rewards, episode_starts, values, log_probs):
+        if self._sb3:
+            import torch as th
+
+            self.rollout_buffer.add(
+                obs, raw_actions, rewards, episode_starts,
+                th.as_tensor(np.asarray(values, dtype=np.float32)),
+                th.as_tensor(np.asarray(log_probs, dtype=np.float32)),
+            )
+        else:
+            self.rollout_buffer.add(
+                obs, raw_actions, rewards, episode_starts, values, log_probs
+            )
+
+    def _compute_returns(self, last_values, dones):
+        if self._sb3:
+            import torch as th
+
+            self.rollout_buffer.compute_returns_and_advantage(
+                last_values=th.as_tensor(np.asarray(last_values, dtype=np.float32)),
+                dones=np.asarray(dones, dtype=bool),
+            )
+        else:
+            self.rollout_buffer.compute_returns_and_advantage(last_values, dones)
+
+    def _flat(self, name, trailing):
+        arr = np.asarray(getattr(self.rollout_buffer, name))
+        return arr.reshape((-1,) + tuple(trailing))
+
+    # ------------------------------------------------------------------ #
+
+    def predict(self, obs, state=None, episode_start=None, deterministic=True):
+        return self.engine.predict(obs, deterministic=deterministic), None
+
+    def save(self, path):
+        blob = {
+            "actor": [m.save_raw() for m in (self.engine.actor_models or [])],
+            "critic": self.engine.critic_model.save_raw()
+            if self.engine.critic_model else None,
+            "actor_leaf_means": self.engine.actor_leaf_means,
+            "actor_leaf_vars": self.engine.actor_leaf_vars,
+            "actor_tree_weights": self.engine.actor_tree_weights,
+            "critic_leaf_means": self.engine.critic_leaf_means,
+            "critic_tree_weights": self.engine.critic_tree_weights,
+            "n_leaf_slots": self.engine._n_leaf_slots,
+            "shared_tree_structure": self.engine.shared_tree_structure,
+            "log_std": getattr(self.engine, "log_std", None),
+            "num_timesteps": self.num_timesteps,
+        }
+        with open(path, "wb") as fh:
+            pickle.dump(blob, fh)
+
+    def load_weights(self, path):
+        with open(path, "rb") as fh:
+            blob = pickle.load(fh)
+        self.engine.actor_models = []
+        for raw in blob["actor"]:
+            b = xgb.Booster()
+            b.load_model(bytearray(raw))
+            self.engine.actor_models.append(b)
+        if blob["critic"] is not None:
+            b = xgb.Booster()
+            b.load_model(bytearray(blob["critic"]))
+            self.engine.critic_model = b
+        self.engine.actor_leaf_means = blob["actor_leaf_means"]
+        self.engine.actor_leaf_vars = blob["actor_leaf_vars"]
+        self.engine.actor_tree_weights = blob["actor_tree_weights"]
+        self.engine.critic_leaf_means = blob["critic_leaf_means"]
+        self.engine.critic_tree_weights = blob["critic_tree_weights"]
+        self.engine._n_leaf_slots = blob["n_leaf_slots"]
+        self.engine.shared_tree_structure = blob["shared_tree_structure"]
+        if blob["log_std"] is not None:
+            self.engine.log_std = blob["log_std"]
+        self.num_timesteps = blob["num_timesteps"]
+        return self
+
+
+# --------------------------------------------------------------------------- #
+# Minimal GAE buffer, used when stable-baselines3 is unavailable
+# --------------------------------------------------------------------------- #
+
+class _SimpleRolloutBuffer:
+    def __init__(self, n_steps, obs_dim, action_dim, n_envs, gamma, gae_lambda):
+        self.n_steps, self.n_envs = n_steps, n_envs
+        self.gamma, self.gae_lambda = gamma, gae_lambda
+        self.observations = np.zeros((n_steps, n_envs) + tuple(obs_dim), np.float32)
+        self.actions = np.zeros((n_steps, n_envs, action_dim), np.float32)
+        self.rewards = np.zeros((n_steps, n_envs), np.float32)
+        self.episode_starts = np.zeros((n_steps, n_envs), np.float32)
+        self.values = np.zeros((n_steps, n_envs), np.float32)
+        self.log_probs = np.zeros((n_steps, n_envs), np.float32)
+        self.advantages = np.zeros((n_steps, n_envs), np.float32)
+        self.returns = np.zeros((n_steps, n_envs), np.float32)
+        self.pos = 0
+
+    def reset(self):
+        self.pos = 0
+
+    def add(self, obs, action, reward, episode_start, value, log_prob):
+        i = self.pos
+        self.observations[i] = obs
+        self.actions[i] = action
+        self.rewards[i] = reward
+        self.episode_starts[i] = episode_start
+        self.values[i] = np.asarray(value).ravel()
+        self.log_probs[i] = np.asarray(log_prob).ravel()
+        self.pos += 1
+
+    def compute_returns_and_advantage(self, last_values, dones):
+        last_values = np.asarray(last_values, dtype=np.float32).ravel()
+        last_gae = np.zeros(self.n_envs, dtype=np.float32)
+        for step in reversed(range(self.n_steps)):
+            if step == self.n_steps - 1:
+                next_non_terminal = 1.0 - np.asarray(dones, dtype=np.float32)
+                next_values = last_values
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1]
+                next_values = self.values[step + 1]
+            delta = (
+                self.rewards[step]
+                + self.gamma * next_values * next_non_terminal
+                - self.values[step]
+            )
+            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+            self.advantages[step] = last_gae
+        self.returns = self.advantages + self.values
+
+
+# --------------------------------------------------------------------------- #
+# Self-test
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    import gymnasium as gym
+
+    class _VecWrap:
+        """Tiny single-env VecEnv shim so the file is runnable standalone."""
+
+        def __init__(self, env):
+            self.env, self.num_envs = env, 1
+            self.observation_space = env.observation_space
+            self.action_space = env.action_space
+            self._ret, self._len = 0.0, 0
+
+        def reset(self):
+            obs, _ = self.env.reset()
+            self._ret, self._len = 0.0, 0
+            return obs[None, :]
+
+        def step(self, actions):
+            a = np.clip(actions[0], self.action_space.low, self.action_space.high)
+            obs, r, term, trunc, info = self.env.step(a)
+            self._ret += r
+            self._len += 1
+            done = term or trunc
+            infos = [dict(info)]
+            if done:
+                infos[0]["episode"] = {"r": self._ret, "l": self._len}
+                infos[0]["terminal_observation"] = obs
+                infos[0]["TimeLimit.truncated"] = bool(trunc and not term)
+                obs, _ = self.env.reset()
+                self._ret, self._len = 0.0, 0
+            return obs[None, :], np.array([r], np.float32), np.array([done]), infos
+
+    from EVCorridorEnv import EVCorridorEnv
+
+    env = _VecWrap(EVCorridorEnv(use_meteostat=False, weather_cache=None))
+    variants = [
+        ("A2C  per-leaf std  shared", dict(use_ppo_clip=False, obs_dependent_std=True)),
+        ("A2C  global  std  shared", dict(use_ppo_clip=False, obs_dependent_std=False)),
+        ("PPO  per-leaf std  shared", dict(use_ppo_clip=True, obs_dependent_std=True)),
+        ("PPO  global  std  shared", dict(use_ppo_clip=True, obs_dependent_std=False)),
+        ("PPO  per-leaf std  per-dim",
+         dict(use_ppo_clip=True, obs_dependent_std=True,
+              shared_tree_structure=False)),
+    ]
+    for variant, kw in variants:
+        model = Hybrid_XGB(
+            env, n_steps=128, n_estimators=40, max_depth=4,
+            awr_update_freq=512, awr_buffer_size=4000, awr_min_samples=200,
+            ppo_lr=0.05, verbose=0, **kw,
+        )
+        model.learn(total_timesteps=2048)
+        d = model.engine.last_diagnostics
+        print(
+            f"{variant}: std={d.get('policy/std_dim0', float('nan')):.3f}/"
+            f"{d.get('policy/std_dim1', float('nan')):.3f}  "
+            f"ceil_frac={d.get('policy/var_at_ceiling_dim0', 0):.2f}  "
+            f"ev={d.get('train/explained_variance', 0):+.3f}  "
+            f"clip={d.get('train/clip_fraction', 0):.3f}  "
+            f"micro_dmu={d.get('train/micro_mu_delta', 0):.3f}  "
+            f"macro_dmu={d.get('train/macro_mu_delta', float('nan')):.3f}"
+        )
