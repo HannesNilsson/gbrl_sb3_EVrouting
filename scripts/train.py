@@ -126,10 +126,10 @@ if __name__ == '__main__':
             
     elif args.env_type == 'ev_truck':
         from env.EVCorridorEnv import EVCorridorEnv
-        # 🟢 THE FIX: Import DummyVecEnv instead of SubprocVecEnv
+        # THE FIX: Import DummyVecEnv instead of SubprocVecEnv
         from stable_baselines3.common.vec_env import DummyVecEnv
         
-        # 🟢 THE FIX: Pass DummyVecEnv to vec_env_cls
+        # THE FIX: Pass DummyVecEnv to vec_env_cls
         env = make_vec_env(EVCorridorEnv, n_envs=args.num_envs, seed=args.seed, env_kwargs=args.env_kwargs, vec_env_cls=DummyVecEnv)
         
         if args.evaluate:
@@ -203,7 +203,7 @@ if __name__ == '__main__':
 
     algo = NAME_TO_ALGO[args.algo_type](env=env, tensorboard_log=tensorboard_log, _init_setup_model=True, **algo_kwargs)
 
-    tb_name = args.algo_type + '_ppo_lr_' + str(args.ppo_lr) + '_awr_beta_' + str(args.awr_beta) + '_use_ppo_clip_' + str(args.use_ppo_clip) + '_obs_dependent_std_' + str(args.obs_dependent_std)
+    tb_name = args.algo_type #+ '_ppo_lr_' + str(args.ppo_lr) + '_awr_beta_' + str(args.awr_beta) + '_use_ppo_clip_' + str(args.use_ppo_clip) + '_obs_dependent_std_' + str(args.obs_dependent_std)
     
     algo.learn(total_timesteps=args.total_n_steps, callback=callback, log_interval=args.log_interval,
                progress_bar=False, tb_log_name=tb_name, **learn_kwargs)
