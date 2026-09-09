@@ -49,7 +49,19 @@ elif [ "$ENV_NAME" == "LunarLander-v2" ]; then
         --gamma=0.995 \
         --n_steps=5 \
         --num_envs=8 \
-        --total_n_steps=200000 \
+        --total_n_steps=1000000 \
+        --learning_rate=lin_0.00083"
+
+elif [ "$ENV_NAME" == "LunarLanderContinuous-v2" ]; then
+    COMMAND="python scripts/train.py --algo_type=a2c_nn \
+        --device=cuda \
+        --ent_coef=0.00001 \
+        --env_name=$ENV_NAME \
+        --env_type=gym \
+        --gamma=0.995 \
+        --n_steps=5 \
+        --num_envs=8 \
+        --total_n_steps=1000000 \
         --learning_rate=lin_0.00083"
 
 elif [ "$ENV_NAME" == "MountainCar-v0" ]; then
@@ -102,7 +114,7 @@ elif [ "$ENV_NAME" == "MountainCarContinuous-v0" ]; then
         --use_sde=True \
         --sde_sample_freq=16 \
         --num_envs=4 \
-        --total_n_steps=100000 \
+        --total_n_steps=1000000 \
         --policy_kwargs=\"{\\\"log_std_init\\\": 0.0, \\\"ortho_init\\\": false}\" \
         --wrapper=normalize"
 

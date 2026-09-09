@@ -46,6 +46,23 @@ if [ "$ENV_NAME" == "LunarLander-v2" ]; then
         --total_n_steps=1500000 \
         --value_lr=0.0031781512018050338"
 
+elif [ "$ENV_NAME" == "LunarLanderContinuous-v2" ]; then
+    COMMAND="python scripts/train.py --algo_type=ppo_gbrl \
+        --batch_size=256 \
+        --clip_range=0.2 \
+        --device=cuda \
+        --ent_coef=0.033440814554543896 \
+        --env_name=$ENV_NAME \
+        --env_type=gym \
+        --gae_lambda=0.98 \
+        --gamma=0.999 \
+        --n_epochs=20 \
+        --n_steps=512 \
+        --num_envs=16 \
+        --policy_lr=0.03113195249121072 \
+        --total_n_steps=1000000 \
+        --value_lr=0.0031781512018050338"
+
 elif [ "$ENV_NAME" == "MountainCar-v0" ]; then
     COMMAND="python scripts/train.py --algo_type=ppo_gbrl \
         --batch_size=256 \

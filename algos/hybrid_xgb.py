@@ -116,14 +116,19 @@ def _leaf_stats(leaf_ids, residual, n_trees, n_leaf_slots):
     """Per-(tree, leaf) count / mean / variance of `residual`.
 
     leaf_ids : (N, n_trees) int
-    residual : (N,) float - residual of the *full* ensemble prediction
+    residual : (N,) shared across trees, or (N, n_trees) one target per tree.
 
-    A single flattened bincount replaces the per-tree Python loop.
+    The second form is what the stage-residual estimator needs: tree i is fit to
+    z_i = y - mu_{1..i-1}, so each tree has its own target rather than sharing
+    the final residual.  A single flattened bincount replaces the per-tree loop
+    either way.
     """
     n = leaf_ids.shape[0]
     offsets = np.arange(n_trees, dtype=np.int64) * n_leaf_slots
     flat = (leaf_ids.astype(np.int64) + offsets[None, :]).ravel()
-    w = np.repeat(residual.astype(np.float64), n_trees)  # row-major match
+    residual = np.asarray(residual, dtype=np.float64)
+    w = (residual.ravel() if residual.ndim == 2
+         else np.repeat(residual, n_trees))          # row-major match
 
     size = n_trees * n_leaf_slots
     cnt = np.bincount(flat, minlength=size).astype(np.float64)
@@ -285,6 +290,12 @@ class XGBoostTreeEngine:
         var_min: float = 1e-3,
         var_max: float | None = None,
         leaf_update_norm: str = "leaf_mean",
+        exploration_rho: float = 0.0,
+        var_mode: str = "residual",
+        exploration_factor: float | None = None,
+        carry_variance: bool = False,
+        var_lr: float | None = None,
+        var_update: str = "log",
         actor_eta: float = 0.05,
         critic_eta: float = 0.05,
         awr_weight_clip: float = 20.0,
@@ -323,6 +334,87 @@ class XGBoostTreeEngine:
             else (span / 2.0) ** 2
         )
         self.leaf_update_norm = leaf_update_norm
+        # Temporal correlation of the exploration noise.  Independent per-step
+        # Gaussian noise averages to nothing over a trajectory, so on tasks that
+        # need a *sustained* push (MountainCarContinuous needs the car rocked at
+        # its resonant frequency for ~100 steps) it never reaches the goal, no
+        # matter how large the variance.  An AR(1) noise process
+        #     n_t = rho * n_{t-1} + sqrt(1 - rho^2) * N(0, 1)
+        # keeps the marginal exactly N(0, 1) - so mu and var keep their meaning
+        # and the Gaussian log-prob stays a valid marginal density - while
+        # correlating consecutive actions.  This is the same trick as OU noise
+        # in DDPG and gSDE in SB3.  rho = 0 recovers independent sampling.
+        self.exploration_rho = float(exploration_rho)
+        self._noise = None
+
+        # How the per-leaf variance is defined, following Nilsson et al.,
+        # "Tree Ensembles for Contextual Bandits" (Alg. 1 line 14, Eq. 9):
+        #
+        #   'residual'    var = mean_n s^2_n          (current default)
+        #   'uncertainty' var = sum_n  s^2_n / c_n    (TEUCB/TETS)
+        #
+        # The division by the leaf count c_n is the substantive difference.
+        # 'residual' measures how noisy the actions in a leaf were, so it decays
+        # as the policy becomes deterministic - exploration stops because
+        # exploration stopped.  'uncertainty' measures how well the ensemble
+        # knows that leaf's mean, so it decays only as that leaf accumulates
+        # data, which is the directed-exploration signal TEUCB and TETS use.
+        # The paper sums over trees under an independence assumption (Eq. 9);
+        # 'residual' averages, since there each round estimates the same
+        # quantity rather than contributing an independent component.
+        #
+        # `exploration_factor` is the paper's nu, applied as nu^2 * var.
+        if var_mode not in ("residual", "uncertainty"):
+            raise ValueError(f"unknown var_mode {var_mode!r}")
+        self.var_mode = var_mode
+        # sigma^2(s) = nu^2 * sum_i v_i[l_i(s)], following Eq. 9 of Nilsson et
+        # al.'s tree-ensemble bandits, where the per-tree variance terms are
+        # summed under an assumption of independence.
+        #
+        # That assumption is naive here: boosted trees are maximally dependent
+        # by construction, since tree i+1 is fit to the residual left by trees
+        # 1..i.  The true aggregate is sum_i Var + 2 sum_{i<j} Cov, and the
+        # covariance terms are neither small nor of known sign, so the effective
+        # number of independent components lies somewhere between 1 and K and is
+        # not identified.  nu absorbs it and is tuned per environment.
+        #
+        # nu = 1/sqrt(K) makes sigma^2 the *average* per-tree variance, and is
+        # K-invariant: a value tuned at one ensemble size transfers to another,
+        # which matters because K is a headline hyperparameter of the method.
+        # Empirically it is also a good default - on LunarLanderContinuous it
+        # beat 0.5x and 2x that scale by ~100 return, and on Pendulum the
+        # objective was flat across the same range.
+        # 'uncertainty' already divides each term by its leaf count, so the
+        # summed standard errors are of the same order as Var(mu_hat) and nu = 1
+        # is the natural scale.  'residual' sums K undivided stage variances,
+        # which over-counts by roughly K, so 1/sqrt(K) is the natural scale.
+        if exploration_factor is not None:
+            self.exploration_factor = float(exploration_factor)
+        elif self.var_mode == "uncertainty":
+            self.exploration_factor = 1.0
+        else:
+            self.exploration_factor = 1.0 / np.sqrt(self.n_estimators)
+        # In A2C/PPO the policy standard deviation is a *parameter* optimised
+        # for return, not an estimate.  The micro-update treats it that way, but
+        # the AWR rebuild overwrites the variance tables with fresh regression
+        # residuals, discarding it.  With carry_variance the previous sigma^2 is
+        # instead evaluated on the buffer states and projected onto the new leaf
+        # partition, so exploration persists across rebuilds.
+        self.carry_variance = bool(carry_variance)
+        # How sigma^2 is stepped by the on-policy stage.
+        #
+        #   'additive' scales the step by (var_max - var_min), which is set by
+        #   the action range.  Once sigma^2 has annealed well below var_max that
+        #   step is comparable to sigma^2 itself - measured on Pendulum, a step
+        #   of 0.12 against a current variance of 0.11-0.30 - so the variance can
+        #   only oscillate, never converge.
+        #
+        #   'log' steps log(sigma^2) instead, so a step is a fixed *fraction* of
+        #   the current variance and remains well-scaled as it anneals.
+        if var_update not in ("additive", "log"):
+            raise ValueError(f"unknown var_update {var_update!r}")
+        self.var_update = var_update
+        self.var_lr = float(self.ppo_lr if var_lr is None else var_lr)
         self.awr_weight_clip = float(awr_weight_clip)
         self.awr_target_ess = awr_target_ess
         self.target_kl = target_kl
@@ -413,6 +505,12 @@ class XGBoostTreeEngine:
 
         n_est = self.n_estimators
         d_eval = self._dmatrix(states)
+
+        # Snapshot sigma^2(s) under the OLD partition before it is replaced.
+        prev_var = None
+        if self.carry_variance and self.actor_models is not None:
+            prev_ids, _ = self._leaf_ids(states)
+            prev_var = self._forward(prev_ids)[1]          # (N, D)
 
         # ---- critic: unweighted regression onto the returns ------------------
         self.critic_model = xgb.train(
@@ -527,16 +625,39 @@ class XGBoostTreeEngine:
                         "the assumed one."
                     )
 
-            residual = actions[:, d] - pred
-            cnt, _, var = _leaf_stats(leaf_ids, residual, n_est, L)
+            # Stage residuals, following the conditional-contribution view of
+            # TEUCB/TETS: leaf l of tree i estimates the mean of
+            #     z_i = a - mu_{1..i-1}(s),
+            # the part of the target still unexplained when tree i is fit, not
+            # the residual of the finished ensemble.  Using the final residual
+            # for every tree makes the K leaf variances redundant estimates of
+            # one quantity; the stage form gives a genuine per-tree
+            # decomposition whose terms decrease along the boosting sequence.
+            contrib = native[d][rounds, leaf_ids]                  # (N, n_est)
+            stage_pred = base + np.cumsum(contrib, axis=1) - contrib
+            Z = actions[:, d][:, None] - stage_pred                # (N, n_est)
+            cnt, _, var = _leaf_stats(leaf_ids, Z, n_est, L)
 
             self.actor_leaf_means[d] = native[d]
             # Per-leaf conditional variance of the residual.  Averaged (not
             # summed) across rounds in `_forward`: each round is a different
             # partition of the same residual, so the rounds are estimates of the
             # same quantity, not independent contributions.
+            if self.var_mode == "uncertainty":
+                leaf_var = var / np.maximum(cnt, 1.0)      # s^2_n / c_n
+            else:
+                leaf_var = var
+            if prev_var is not None:
+                # Project the previous sigma^2 onto the new partition: each new
+                # leaf takes the mean of the old sigma^2 over the samples that
+                # land in it.  sigma^2 aggregates by averaging over trees, so
+                # the projected per-leaf value is the target value itself.
+                _, proj, _ = _leaf_stats(leaf_ids, prev_var[:, d], n_est, L)
+                # prev_var is the aggregate nu^2 * sum_i v_i; invert to per-leaf.
+                proj = proj / (self.exploration_factor ** 2 * n_est)
+                leaf_var = np.where(cnt > 0, proj, leaf_var)
             self.actor_leaf_vars[d] = np.where(
-                cnt > 1, np.maximum(var, self.var_min[d]), self.var_min[d]
+                cnt > 1, np.maximum(leaf_var, self.var_min[d]), self.var_min[d]
             )
             self.actor_tree_weights[d] = _inverse_magnitude_weights(native[d], cnt)
 
@@ -631,7 +752,8 @@ class XGBoostTreeEngine:
         if self.obs_dependent_std:
             var = np.empty((n, self.action_dim))
             for d in range(self.action_dim):
-                var[:, d] = self.actor_leaf_vars[d][rounds, actor_ids[d]].mean(axis=1)
+                var[:, d] = self.actor_leaf_vars[d][rounds, actor_ids[d]].sum(axis=1)
+            var *= self.exploration_factor ** 2
             np.clip(var, self.var_min[None, :], self.var_max[None, :], out=var)
         else:
             var = np.broadcast_to(
@@ -670,9 +792,28 @@ class XGBoostTreeEngine:
 
         actor_ids, _ = self._leaf_ids(obs)
         mu, var = self._forward(actor_ids)
-        raw = np.random.normal(loc=mu, scale=np.sqrt(var))
+        raw = mu + np.sqrt(var) * self._draw_noise(mu.shape)
         lp = self._log_prob(raw, mu, var)
         return np.clip(raw, self.action_low, self.action_high), raw, lp
+
+    def _draw_noise(self, shape):
+        if self.exploration_rho <= 0.0:
+            return np.random.normal(size=shape)
+        if self._noise is None or self._noise.shape != shape:
+            self._noise = np.random.normal(size=shape)
+        rho = self.exploration_rho
+        self._noise = (rho * self._noise
+                       + np.sqrt(1.0 - rho ** 2) * np.random.normal(size=shape))
+        return self._noise
+
+    def reset_noise(self, mask):
+        """Redraw the noise state for environments that just terminated."""
+        if self._noise is None or self.exploration_rho <= 0.0:
+            return
+        mask = np.asarray(mask, dtype=bool)
+        if mask.any():
+            self._noise[mask] = np.random.normal(size=(int(mask.sum()),
+                                                       self._noise.shape[1]))
 
     def predict(self, obs, deterministic=True):
         """Greedy (mean) action, for evaluation."""
@@ -780,10 +921,19 @@ class XGBoostTreeEngine:
                     for d in range(self.action_dim)
                 ])
                 u_var = self._adam_var.step(g_var)
-                # var = mean_r v[r]  ->  a uniform delta on every round moves the
-                # aggregate by exactly that delta.
-                var_step = lr_scale * self.ppo_lr * (self.var_max - self.var_min)
-                self.actor_leaf_vars += var_step[:, None, None] * u_var
+                if self.var_update == "log":
+                    # Multiplicative: every leaf moves by the same fraction, so
+                    # the aggregate sigma^2 = nu^2 * sum_i v_i moves by that
+                    # fraction too, with no K or nu correction needed.
+                    self.actor_leaf_vars *= np.exp(
+                        np.clip(lr_scale * self.var_lr * u_var, -0.5, 0.5))
+                else:
+                    # sigma^2 = nu^2 * sum_i v_i  ->  a uniform delta on all K
+                    # trees moves the aggregate by nu^2 * K * delta, so divide.
+                    var_step = (lr_scale * self.var_lr
+                                * (self.var_max - self.var_min)
+                                / (self.exploration_factor ** 2 * n_est))
+                    self.actor_leaf_vars += var_step[:, None, None] * u_var
             if self.obs_dependent_std:
                 np.clip(self.actor_leaf_vars,
                         self.var_min[:, None, None], self.var_max[:, None, None],
@@ -829,6 +979,12 @@ class XGBoostTreeEngine:
         for d in range(self.action_dim):
             diag[f"policy/std_dim{d}"] = float(np.sqrt(var[:, d]).mean())
             diag[f"policy/mu_dim{d}"] = float(mu[:, d].mean())
+            # Spread of the policy mean ACROSS STATES.  mu_dim* alone cannot
+            # distinguish a timid policy (mu ~ 0 everywhere) from a symmetric
+            # state-dependent one (mu = +/-a_max, averaging to 0).  If this is
+            # small relative to the action range, the actor is not discriminating
+            # between states at all.
+            diag[f"policy/mu_spread_dim{d}"] = float(mu[:, d].std())
             diag[f"policy/var_at_ceiling_dim{d}"] = float(
                 np.mean(var[:, d] >= self.var_max[d] - 1e-9)
             )
@@ -870,6 +1026,13 @@ class Hybrid_XGB:
         ent_coef: float = 0.0,
         target_kl: float | None = None,
         leaf_update_norm: str = "leaf_mean",
+        exploration_rho: float = 0.0,
+        var_mode: str = "residual",
+        exploration_factor: float | None = None,
+        carry_variance: bool = False,
+        var_lr: float | None = None,
+        var_update: str = "log",
+        var_min: float = 1e-3,
         shared_tree_structure: bool = True,
         verify_reconstruction: bool = True,
         **kwargs,
@@ -901,6 +1064,13 @@ class Hybrid_XGB:
             critic_lr=critic_lr,
             ent_coef=ent_coef,
             leaf_update_norm=leaf_update_norm,
+            exploration_rho=exploration_rho,
+            var_mode=var_mode,
+            exploration_factor=exploration_factor,
+            carry_variance=carry_variance,
+            var_lr=var_lr,
+            var_update=var_update,
+            var_min=var_min,
             awr_target_ess=awr_target_ess,
             actor_eta=actor_eta,
             critic_eta=critic_eta,
@@ -990,8 +1160,22 @@ class Hybrid_XGB:
         episode_starts = np.ones(self.n_envs, dtype=bool)
         iteration, start_time = 0, time.time()
 
+        # Echo the settings that actually reached the engine.  Several of these
+        # were historically dropped between the CLI and the constructor, so a
+        # run could silently use defaults while the shell script said otherwise.
+        e = self.engine
+        cfg = (f"n_estimators={e.n_estimators} max_depth={e.actor_params['max_depth']} "
+               f"gamma={self.gamma} ppo_lr={e.ppo_lr} critic_lr={e.critic_lr} "
+               f"exploration_rho={e.exploration_rho} nu={e.exploration_factor:.4f} "
+               f"var_mode={e.var_mode} use_ppo_clip={e.use_ppo_clip} "
+               f"obs_dependent_std={e.obs_dependent_std} "
+               f"awr_target_ess={e.awr_target_ess} awr_update_freq={self.awr_update_freq} "
+               f"awr_buffer_size={self.awr_buffer['max_size']} n_steps={self.n_steps} "
+               f"n_envs={self.n_envs}")
         if self.verbose:
             print("Starting TERL / XGBoost training loop...")
+            print(f"  effective config: {cfg}")
+        self._effective_config = cfg
 
         while self.num_timesteps < total_timesteps:
             self.rollout_buffer.reset()
@@ -1029,6 +1213,7 @@ class Hybrid_XGB:
 
                 obs = next_obs
                 episode_starts = np.asarray(dones, dtype=bool)
+                self.engine.reset_noise(episode_starts)
                 self.num_timesteps += self.n_envs
                 self._steps_since_awr += self.n_envs
 
@@ -1089,6 +1274,15 @@ class Hybrid_XGB:
             # ---- 5. logging -------------------------------------------------
             if self.logger and iteration % log_interval == 0:
                 elapsed = max(time.time() - start_time, 1e-9)
+                # Logged every dump so the effective config is recoverable from
+                # the event file alone, without the stdout log.
+                self.logger.record("config/exploration_rho",
+                                   float(self.engine.exploration_rho))
+                self.logger.record("config/n_estimators", int(self.engine.n_estimators))
+                self.logger.record("config/max_depth",
+                                   int(self.engine.actor_params['max_depth']))
+                self.logger.record("config/gamma", float(self.gamma))
+                self.logger.record("config/ppo_lr", float(self.engine.ppo_lr))
                 self.logger.record("time/iterations", iteration)
                 self.logger.record("time/fps", int(self.num_timesteps / elapsed))
                 self.logger.record("time/total_timesteps", self.num_timesteps)

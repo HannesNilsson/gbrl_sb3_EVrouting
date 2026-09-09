@@ -45,6 +45,22 @@ if [ "$ENV_NAME" == "LunarLander-v2" ]; then
         --use_sde=False \
         --wrapper=None"
 
+elif [ "$ENV_NAME" == "LunarLanderContinuous-v2" ]; then
+    COMMAND="python scripts/train.py --algo_type=ppo_nn \
+        --batch_size=64 \
+        --device=cuda \
+        --ent_coef=0.01 \
+        --env_name=$ENV_NAME \
+        --env_type=gym \
+        --gae_lambda=0.98 \
+        --gamma=0.999 \
+        --n_epochs=4 \
+        --n_steps=1024 \
+        --num_envs=16 \
+        --total_n_steps=1000000 \
+        --use_sde=False \
+        --wrapper=None"
+
 elif [ "$ENV_NAME" == "Acrobot-v1" ]; then
     COMMAND="python scripts/train.py --algo_type=ppo_nn \
         --device=cuda \
@@ -70,7 +86,7 @@ elif [ "$ENV_NAME" == "Pendulum-v1" ]; then
         --n_epochs=10 \
         --n_steps=1024 \
         --num_envs=4 \
-        --total_n_steps=100000 \
+        --total_n_steps=1000000 \
         --learning_rate=0.001 \
         --clip_range=0.2 \
         --use_sde=True \
@@ -119,7 +135,7 @@ elif [ "$ENV_NAME" == "MountainCarContinuous-v0" ]; then
         --n_epochs=10 \
         --n_steps=8 \
         --num_envs=1 \
-        --total_n_steps=20000 \
+        --total_n_steps=1000000 \
         --batch_size=256 \
         --learning_rate=7.77e-05 \
         --clip_range=0.1 \

@@ -17,6 +17,7 @@ ENVS=(
     'Acrobot-v1'
     'CartPole-v1'
     'LunarLander-v2'
+    'LunarLanderContinuous-v2'
     'Pendulum-v1'
     'MountainCarContinuous-v0'
     'MountainCar-v0'
@@ -49,7 +50,7 @@ fi
 
 # Define total_n_steps based on environment
 if [ "$ENV_NAME" == "LunarLander-v2" ]; then
-    TOTAL_N_STEPS=1500000
+    TOTAL_N_STEPS=1000000
 else
     TOTAL_N_STEPS=1000000
 fi

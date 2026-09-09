@@ -140,7 +140,25 @@ elif [ "$ENV_NAME" == "LunarLander-v2" ]; then
         --normalize_advantage=True \
         --num_envs=32 \
         --policy_lr=0.16027457635754927 \
-        --total_n_steps=1500000 \
+        --total_n_steps=1000000 \
+        --vf_coef=0.5 \
+        --value_lr=0.04232447250591277 \
+        --wrapper=None \
+        --wrapper_kwargs=None"
+
+elif [ "$ENV_NAME" == "LunarLanderContinuous-v2" ]; then
+    COMMAND="python scripts/train.py --algo_type=a2c_gbrl \
+        --device=cuda \
+        --ent_coef=1e-05 \
+        --env_name=$ENV_NAME \
+        --env_type=gym \
+        --gae_lambda=1 \
+        --gamma=0.995 \
+        --n_steps=5 \
+        --normalize_advantage=True \
+        --num_envs=32 \
+        --policy_lr=0.16027457635754927 \
+        --total_n_steps=1000000 \
         --vf_coef=0.5 \
         --value_lr=0.04232447250591277 \
         --wrapper=None \

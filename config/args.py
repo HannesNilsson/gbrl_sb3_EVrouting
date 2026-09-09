@@ -307,10 +307,58 @@ def parse_args():
     parser.add_argument('--feature_weights', type=json_string_to_list)
 
     #HYBRID_XGB params
-    parser.add_argument('--ppo_lr', type=float, default=0.02, help='Learning rate for PPO')
-    parser.add_argument('--awr_beta', type=float, default=0.05, help='Advantage weighting beta for AWR')
-    parser.add_argument('--use_ppo_clip', action='store_true')
-    parser.add_argument('--obs_dependent_std', action='store_true')
+    parser.add_argument('--ppo_lr', type=float, default=0.02,
+                        help='On-policy leaf-update step, as a FRACTION OF THE ACTION RANGE '
+                             'per micro-update (leaf steps are Adam-normalised). Not an SGD '
+                             'learning rate: values near 1e-3 are ~30x too small.')
+    parser.add_argument('--awr_beta', type=float, default=0.05,
+                        help='AWR temperature. Ignored unless --awr_target_ess=0, since the '
+                             'temperature is otherwise chosen by bisection to hit the target '
+                             'effective sample size.')
+    parser.add_argument('--awr_target_ess', type=float, default=0.3,
+                        help='Target effective sample size (fraction of the AWR buffer) used '
+                             'to select the AWR temperature. Set 0 to use --awr_beta.')
+    parser.add_argument('--xgb_eta', type=float, default=0.05,
+                        help='XGBoost shrinkage for the actor and critic ensembles. This is '
+                             'NOT --learning_rate: that is the neural-network step size '
+                             '(3e-4 in defaults.yaml), and at eta=3e-4 a 100-round ensemble '
+                             'reproduces only ~3%% of its regression target, leaving the '
+                             'policy mean near zero. Typical values are 0.03-0.3.')
+    parser.add_argument('--critic_lr_terl', type=float,
+                        help='Leaf-update step for the TERL critic. Defaults to --ppo_lr. '
+                             'Distinct from --critic_lr, which belongs to GBRL\'s value '
+                             'optimizer and defaults to 0.1.')
+    parser.add_argument('--use_ppo_clip', action='store_true',
+                        help='Use the clipped PPO surrogate for the on-policy stage '
+                             'instead of A2C.')
+    # str2bool, not store_true: the engine default is True, so a store_true flag
+    # would silently flip the default whenever it was omitted.
+    parser.add_argument('--obs_dependent_std', type=str2bool, default=True)
+    parser.add_argument('--exploration_rho', type=float, default=0.0,
+                        help='AR(1) correlation of the exploration noise, in [0, 1). '
+                             'Independent noise averages out over a trajectory, so tasks '
+                             'needing a sustained push (MountainCarContinuous) fail at 0 '
+                             'regardless of noise scale; 0.8-0.9 solved it on 5/5 seeds. '
+                             'Leave at 0 where consecutive decisions are near-independent.')
+    parser.add_argument('--exploration_factor', type=float,
+                        help='Exploration factor nu: sigma^2 = nu^2 * sum_i v_i. '
+                             'Default None -> 1/sqrt(n_estimators), which is K-invariant.')
+    parser.add_argument('--var_mode', type=str, default='residual',
+                        choices=['residual', 'uncertainty'])
+    parser.add_argument('--carry_variance', type=str2bool, default=False,
+                        help='Carry the learned sigma^2 across AWR rebuilds instead of '
+                             'recomputing it from regression residuals.')
+    parser.add_argument('--var_update', type=str, default='log',
+                        choices=['additive', 'log'],
+                        help="How the on-policy stage steps sigma^2. 'additive' scales "
+                             "the step by the action range, so once sigma^2 anneals the "
+                             "step is comparable to sigma^2 itself and it can only "
+                             "oscillate. 'log' steps log(sigma^2), making each step a "
+                             "fixed fraction of the current variance.")
+    parser.add_argument('--var_lr', type=float,
+                        help='Step size for the sigma^2 update. Defaults to --ppo_lr.')
+    parser.add_argument('--shared_tree_structure', type=str2bool, default=True)
+    parser.add_argument('--n_ppo_epochs', type=int, default=4)
     parser.add_argument('--awr_update_freq', type=int)
     parser.add_argument('--awr_buffer_size', type=int)
     parser.add_argument('--n_estimators', type=int)
@@ -1073,33 +1121,44 @@ def process_policy_kwargs(args):
 
     elif args.algo_type == 'hybrid_xgb':
 
-        default_actor_params = {
-            'objective': 'reg:squarederror',
-            'max_depth': args.max_depth,
-            'tree_method': 'hist',
-            'base_score': 0,
-            'eta': args.learning_rate
-        }
-        
-        default_critic_params = {
-            'objective': 'reg:squarederror',
-            'max_depth': args.max_depth,
-            'tree_method': 'hist',
-            'base_score': 0,
-            'eta': args.learning_rate
-        }
+        # Hybrid_XGB takes flat constructor arguments and swallows unknown keys
+        # into **kwargs, so actor_params/critic_params were accepted and ignored
+        # and --max_depth never reached the agent.  Everything is passed at top
+        # level now.  Two names are deliberately NOT reused from the shared arg
+        # set, because they mean different things for this agent:
+        #   learning_rate -> NN step size (3e-4); the XGBoost shrinkage is --xgb_eta
+        #   critic_lr     -> GBRL value optimizer (0.1); the TERL leaf step is
+        #                    --critic_lr_terl, defaulting to --ppo_lr
+        def _opt(name, default=None):
+            v = getattr(args, name, None)
+            return default if v is None else v
 
         algo_kwargs = {
-            "n_estimators": args.n_estimators if hasattr(args, 'n_estimators') and args.n_estimators else 500,
-            "awr_update_freq": args.awr_update_freq if hasattr(args, 'awr_update_freq') else 10000,
-            "awr_buffer_size": args.awr_buffer_size if hasattr(args, 'awr_buffer_size') else 15000,
+            "n_estimators": _opt('n_estimators', 500),
+            "awr_update_freq": _opt('awr_update_freq', 10000),
+            "awr_buffer_size": _opt('awr_buffer_size', 15000),
             "ppo_lr": args.ppo_lr,
+            "critic_lr": _opt('critic_lr_terl', args.ppo_lr),
             "awr_beta": args.awr_beta,
+            "awr_target_ess": (args.awr_target_ess
+                               if getattr(args, 'awr_target_ess', 0.3) else None),
             "n_steps": args.n_steps,
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,
-            "actor_params": default_actor_params,  # 🟢 Variable is now defined
-            "critic_params": default_critic_params,
+            "max_depth": _opt('max_depth', 6),
+            "actor_eta": _opt('xgb_eta', 0.05),
+            "critic_eta": _opt('xgb_eta', 0.05),
+            "ent_coef": _opt('ent_coef', 0.0),
+            "use_ppo_clip": bool(getattr(args, 'use_ppo_clip', False)),
+            "obs_dependent_std": bool(_opt('obs_dependent_std', True)),
+            "n_ppo_epochs": _opt('n_ppo_epochs', 4),
+            "exploration_rho": _opt('exploration_rho', 0.0),
+            "exploration_factor": getattr(args, 'exploration_factor', None),
+            "var_mode": _opt('var_mode', 'residual'),
+            "carry_variance": bool(_opt('carry_variance', False)),
+            "var_update": _opt('var_update', 'log'),
+            "var_lr": getattr(args, 'var_lr', None),
+            "shared_tree_structure": bool(_opt('shared_tree_structure', True)),
             "device": args.device,
             "seed": args.seed,
             "verbose": args.verbose,
