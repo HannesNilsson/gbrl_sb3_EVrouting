@@ -41,6 +41,20 @@ following corrections relative to the first draft implementation:
       action is wasted at the destination node.
  13.  Battery state of health optionally persists across episodes, which is
       what makes the environment non-stationary in the sense of Sec. 2.2.
+ 14.  tau (Eq. 12) is redefined from "hours driven" to "hours remaining
+      before EU rules force a stop" (whichever of the 4.5h inter-break or 9h
+      daily limit binds first). The eu-state block adds one further value:
+      the duration of that pending stop - the 30/45 min break or the full
+      11h daily rest, whichever is actually closer. No separate categorical
+      flag is needed: the two magnitudes are far enough apart that the
+      distinction is trivial to recover from the value alone, and which of
+      0.5h/0.75h a pending break reports already encodes whether half a
+      break is banked, so that boolean isn't exposed separately either.
+      This value is 0 when include_eu_state=False; break-specific
+      diagnostics (time until next break regardless of the daily limit,
+      that break's required length, an explicit daily-rest flag) are still
+      reported via `_info` even though they're redundant with the single
+      observed value and are not part of the observation itself.
 
 NOTES on calibration
 --------------------
@@ -99,7 +113,8 @@ class EVCorridorEnv(gym.Env):
         initial_capacity_kwh: float = 600.0,
         tare_weight_t: float = 20.0,
         load_weight_range_t: tuple[float, float] = (10.0, 45.0),
-        charge_efficiency: float = 0.92,
+        #charge_efficiency: float = 0.92,
+        charge_efficiency: float = 1.0,  #assume grid_side = battery_side
         # --- driver regulation -------------------------------------------------
         # --- EU Regulation (EC) 561/2006 ---------------------------------------
         max_drive_before_break: float = 4.5,
@@ -209,7 +224,7 @@ class EVCorridorEnv(gym.Env):
         self._load_temperature_series()
 
         # ---- observation space ------------------------------------------------
-        obs_dim = 10 + (2 if self.include_eu_state else 0) + (
+        obs_dim = 10 + (1 if self.include_eu_state else 0) + (
             1 if self.include_charger_power else 0)
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -464,20 +479,20 @@ class EVCorridorEnv(gym.Env):
         )
 
         obs = [
-            self.S_t, self.Q_t, self.drive_today, self.p_t,
+            self.S_t, self.Q_t, self._time_until_forced_stop(), self.p_t,
             rem_dist, next_dist, rem_alt, next_alt,
             self.h_t, self.w_t,
         ]
         if self.include_eu_state:
-            # Without these the MDP is partially observed: the agent cannot tell
-            # whether the next leg will trigger a 45 min break or an 11 h daily
-            # rest, and whether half a break is already banked.  Eq. 12 of the
-            # draft needs extending to match; set
-            # include_eu_state=False to recover the 10-dimensional vector.
-            obs.extend([
-                float(self.drive_since_break),
-                float(self.break_part_taken),
-            ])
+            # Without this the MDP is partially observed: the agent cannot tell
+            # how long the upcoming forced stop will be. A single duration
+            # already distinguishes a short break (0.5/0.75h) from the full
+            # 11h daily rest by magnitude alone - no separate flag needed, and
+            # `break_part_taken` (whether half a break is banked) is already
+            # baked into which of 0.5/0.75 this reports, so it isn't exposed
+            # separately either. Eq. 12 of the draft needs extending to match;
+            # set include_eu_state=False to recover the 10-dimensional vector.
+            obs.append(self._pending_stop_duration())
         if self.include_charger_power:
             obs.append(float(self.charger_powers[node]))
         return np.asarray(obs, dtype=np.float32)
@@ -490,7 +505,7 @@ class EVCorridorEnv(gym.Env):
         lo_list = [
             0.0,                                        # S_t
             self.eol_capacity_fraction * self.Q_nom,    # Q_t
-            0.0,                                        # drive_today
+            0.0,                                        # tau: hours until forced stop
             0.5 * self.c_e,                             # p_t
             0.0,                                        # x_d
             0.0,                                        # x_c
@@ -500,7 +515,9 @@ class EVCorridorEnv(gym.Env):
             self.tare_weight_t + self.load_weight_range_t[0],   # w_t
         ]
         hi_list = [
-            1.0, self.Q_nom, self.max_daily_drive, 2.0 * self.c_e,
+            1.0, self.Q_nom,
+            min(self.max_drive_before_break, self.max_daily_drive),
+            2.0 * self.c_e,
             total_km, max_jump,
             float(max(0.0, alt_cum.max())),
             float(self.jump_altitudes.max()),
@@ -508,8 +525,8 @@ class EVCorridorEnv(gym.Env):
             self.tare_weight_t + self.load_weight_range_t[1],
         ]
         if self.include_eu_state:
-            lo_list += [0.0, 0.0]
-            hi_list += [self.max_drive_before_break, 1.0]
+            lo_list.append(min(self.split_break_second, self.break_duration))
+            hi_list.append(max(self.daily_rest_hours, self.break_duration))
         if self.include_charger_power:
             lo_list.append(0.0)
             hi_list.append(float(self.charger_powers.max()))
@@ -524,6 +541,11 @@ class EVCorridorEnv(gym.Env):
             "soh": float(self.Q_t / self.Q_nom),
             "drive_today_h": float(self.drive_today),
             "drive_since_break_h": float(self.drive_since_break),
+            "time_until_forced_stop_h": float(self._time_until_forced_stop()),
+            "pending_stop_duration_h": float(self._pending_stop_duration()),
+            "is_daily_rest_pending": bool(self._is_daily_rest_pending()),
+            "time_until_next_break_h": float(self._time_until_next_break()),
+            "required_break_length_h": float(self._required_break()),
             "clock_h": float(self.global_hour),
             "load_t": float(self.load_t),
             "battery_replacements": int(self.battery_replacements),
@@ -597,6 +619,47 @@ class EVCorridorEnv(gym.Env):
         """Break still owed: 30 min if the first split part is banked, else 45."""
         return (self.split_break_second if self.break_part_taken
                 else self.break_duration)
+
+    def _time_until_next_break(self) -> float:
+        """Hours of driving left before the 4.5h inter-break limit is hit,
+        independent of the 9h daily limit. Internal only - use
+        `_regulation_horizon` for anything exposed to the agent."""
+        return float(max(0.0, self.max_drive_before_break - self.drive_since_break))
+
+    def _regulation_horizon(self) -> tuple[float, float, bool]:
+        """(hours until a stop is forced, duration of that stop, is it a daily rest).
+
+        Whichever EU limit binds first determines all three: if the 9h daily
+        limit is the (or a tied) binding constraint, the pending stop is the
+        full 11h daily rest; otherwise it's the 45/30 min break still owed.
+        The `until_daily <= until_break` tie-break mirrors the priority
+        `_drive_with_rules` applies once a limit is actually hit (it checks
+        the daily limit first), so this always matches what `_drive_with_rules`
+        will actually do once tau reaches 0.
+        """
+        until_break = self._time_until_next_break()
+        until_daily = self.max_daily_drive - self.drive_today
+        if until_daily <= until_break:
+            return max(0.0, until_daily), self.daily_rest_hours, True
+        return until_break, self._required_break(), False
+
+    def _time_until_forced_stop(self) -> float:
+        """tau in Eq. 12: hours the truck may still drive before EU rules
+        force a stop (whichever of the break or daily limit binds first).
+        Reaches 0 exactly when `_drive_with_rules` would insert a break or
+        daily rest on the next driving step."""
+        return self._regulation_horizon()[0]
+
+    def _pending_stop_duration(self) -> float:
+        """Duration (hours) of whichever stop tau counts down to: the full
+        11h daily rest, or the 30/45 min break still owed - whichever the
+        truck is actually closer to triggering."""
+        return self._regulation_horizon()[1]
+
+    def _is_daily_rest_pending(self) -> bool:
+        """True if the stop tau counts down to is the 11h daily rest rather
+        than a short break."""
+        return self._regulation_horizon()[2]
 
     def _drive_with_rules(self, drive_time: float) -> dict:
         """Drive `drive_time` hours, inserting every stop the law requires."""
@@ -960,8 +1023,12 @@ if __name__ == "__main__":
     obs, _ = env.reset(seed=0)
     total = 0.0
     for _ in range(env.num_nodes - 1):
-        soc, tau = obs[0], obs[2]
-        stop = 11.0 if tau > 8.0 else (0.6 if soc < 0.55 else 0.0)
+        # tau (obs[2]) counts DOWN to a forced stop; obs[10] (include_eu_state=
+        # True) is that stop's actual duration - 0.5/0.75h for a break, or the
+        # full 11h for a daily rest, distinguishable by magnitude alone - so
+        # this heuristic can size its voluntary stop correctly either way.
+        soc, tau, pending_duration = obs[0], obs[2], obs[10]
+        stop = pending_duration if tau < 1.0 else (0.6 if soc < 0.55 else 0.0)
         obs, reward, terminated, truncated, info = env.step(np.array([stop, 0.8]))
         total += reward
         if terminated or truncated:

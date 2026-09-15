@@ -52,6 +52,23 @@ Fixes relative to the first draft implementation
      `train/clip_fraction`, `train/approx_kl`, `train/explained_variance`.
 14.  Variance bounds and the global log-std are per action dimension.  A single
      scalar scale is wrong when T_charging spans [0, 11] and C_target [0, 2].
+15.  Leaf-update weights for the actor's mean table, the critic's value
+     table, and (in the "additive" var_update path) the actor's variance
+     table, default to proportional to each tree's own current leaf
+     magnitude - not inversely proportional. A fixed-size gradient step has
+     the largest effect on the final prediction wherever a tree already
+     contributes most to it (mu, V, and sigma^2 are all plain sums over K
+     trees), so the step budget is concentrated there rather than on
+     low-magnitude trees. Every weight set still sums to 1 (so the
+     *aggregate* output moves by exactly the intended amount, independent of
+     K), and each is computed from its own table's leaf values -
+     mean-magnitude for mu, variance-magnitude for sigma^2, value-magnitude
+     for V - not borrowed from another table. `invert_tree_weights=True`
+     reverts all three to the original inverse-magnitude scheme, for
+     ablating the two against each other. The default "log" var_update path
+     needs no such weighting at all regardless of this setting: scaling
+     every leaf by the same multiplicative factor scales the leaf-variance
+     sum by exactly that factor regardless of the per-tree distribution.
 """
 
 from __future__ import annotations
@@ -228,20 +245,30 @@ def _target_ess_beta(adv, target_ess, clip, lo=0.05, hi=50.0, iters=40):
     return 0.5 * (lo + hi)
 
 
-def _inverse_magnitude_weights(leaf_means, counts):
-    """Per-tree weights inversely proportional to mean |leaf value|.
+def _magnitude_weights(leaf_means, counts, invert):
+    """Per-tree weights derived from mean |leaf value| within populated leaves,
+    summing to 1 (so the *aggregate* mu/sigma^2 moves by exactly lr * grad,
+    independent of K - see the callers).
 
-    Early boosting rounds carry the bulk of the signal and have large leaf
-    values; later rounds fit small residuals.  Normalising by magnitude puts
-    every tree on the same scale.  Weights sum to 1, so the total change in the
-    ensemble output equals lr * grad.
+    invert=False (proportional): a tree's share of the step budget scales
+    with how much it currently contributes to the ensemble output, since a
+    fixed-size change there has the largest effect on the final prediction.
+    Used for the actor's mean and (additive-mode) variance tables.
+
+    invert=True: the inverse - concentrates the budget on low-magnitude
+    trees instead. Used for the critic, unchanged from the original design.
     """
     mask = counts > 0
     num = np.abs(leaf_means * mask).sum(axis=1)
     den = np.maximum(mask.sum(axis=1), 1)
     mean_abs = num / den
-    raw = 1.0 / (mean_abs + 1e-8)
-    return (raw / raw.sum()).astype(np.float64)
+    raw = 1.0 / (mean_abs + 1e-8) if invert else mean_abs
+    total = raw.sum()
+    if total <= 1e-12:
+        # No signal yet (e.g. every tree still at base_score) - fall back to
+        # an even split rather than dividing by ~0.
+        return np.full_like(raw, 1.0 / len(raw))
+    return (raw / total).astype(np.float64)
 
 
 # --------------------------------------------------------------------------- #
@@ -304,6 +331,7 @@ class XGBoostTreeEngine:
         grad_clip: float = 10.0,
         shared_tree_structure: bool = True,
         verify_reconstruction: bool = True,
+        invert_tree_weights: bool = False,
     ):
         self.action_dim = int(action_dim)
         self.n_estimators = int(n_estimators)
@@ -414,6 +442,13 @@ class XGBoostTreeEngine:
         if var_update not in ("additive", "log"):
             raise ValueError(f"unknown var_update {var_update!r}")
         self.var_update = var_update
+        # How the leaf-update step is distributed across the K trees of mu,
+        # V, and (additive-mode) sigma^2 - all plain sums over trees. Default
+        # (False) weights proportionally to each tree's own current leaf
+        # magnitude, since a fixed-size step has the largest effect on the
+        # final prediction wherever a tree already contributes most to it -
+        # see Fix 15. True reverts to the original inverse-magnitude scheme.
+        self.invert_tree_weights = bool(invert_tree_weights)
         self.var_lr = float(self.ppo_lr if var_lr is None else var_lr)
         self.awr_weight_clip = float(awr_weight_clip)
         self.awr_target_ess = awr_target_ess
@@ -454,6 +489,7 @@ class XGBoostTreeEngine:
         self.actor_leaf_means = None    # (D, n_est, L)
         self.actor_leaf_vars = None     # (D, n_est, L)
         self.actor_tree_weights = None  # (D, n_est)
+        self.actor_var_tree_weights = None  # (D, n_est) - only used by var_update="additive"
         self.critic_leaf_means = None   # (n_est, L)
         self.critic_tree_weights = None # (n_est,)
         self._n_leaf_slots = 0
@@ -598,6 +634,7 @@ class XGBoostTreeEngine:
             np.ones((self.action_dim, n_est, L)) * self.var_min[:, None, None]
         )
         self.actor_tree_weights = np.zeros((self.action_dim, n_est))
+        self.actor_var_tree_weights = np.zeros((self.action_dim, n_est))
 
         if self.verify_reconstruction:
             ref = np.asarray(
@@ -659,7 +696,16 @@ class XGBoostTreeEngine:
             self.actor_leaf_vars[d] = np.where(
                 cnt > 1, np.maximum(leaf_var, self.var_min[d]), self.var_min[d]
             )
-            self.actor_tree_weights[d] = _inverse_magnitude_weights(native[d], cnt)
+            self.actor_tree_weights[d] = _magnitude_weights(
+                native[d], cnt, invert=self.invert_tree_weights
+            )
+            # Same construction as actor_tree_weights, but from this tree's own
+            # variance leaves rather than the mean leaves - see Fix 15/16.  Used
+            # only by the "additive" var_update path; the default "log" path
+            # doesn't need any per-tree weighting (see train_micro).
+            self.actor_var_tree_weights[d] = _magnitude_weights(
+                self.actor_leaf_vars[d], cnt, invert=self.invert_tree_weights
+            )
 
         # ---- critic leaf means / tree weights --------------------------------
         native_c = _native_leaf_array(critic_leaves, n_est, max_lid)
@@ -678,7 +724,9 @@ class XGBoostTreeEngine:
                 )
         cnt_c, _, _ = _leaf_stats(leaf_ids_c, returns - pred_c, n_est, L)
         self.critic_leaf_means = native_c
-        self.critic_tree_weights = _inverse_magnitude_weights(native_c, cnt_c)
+        self.critic_tree_weights = _magnitude_weights(
+            native_c, cnt_c, invert=self.invert_tree_weights
+        )
 
         # Adam moments are tied to the leaf partition, which has just changed.
         self._adam_mu = _LeafAdam(self.actor_leaf_means.shape)
@@ -924,16 +972,29 @@ class XGBoostTreeEngine:
                 if self.var_update == "log":
                     # Multiplicative: every leaf moves by the same fraction, so
                     # the aggregate sigma^2 = nu^2 * sum_i v_i moves by that
-                    # fraction too, with no K or nu correction needed.
+                    # fraction too, with no K or nu correction needed - and no
+                    # tree weighting either, since introducing one here would
+                    # make different trees' leaves move by different fractions,
+                    # forfeiting exactly this invariant.
                     self.actor_leaf_vars *= np.exp(
                         np.clip(lr_scale * self.var_lr * u_var, -0.5, 0.5))
                 else:
-                    # sigma^2 = nu^2 * sum_i v_i  ->  a uniform delta on all K
-                    # trees moves the aggregate by nu^2 * K * delta, so divide.
+                    # sigma^2 = nu^2 * sum_i v_i is a sum over K trees, so a
+                    # step needs distributing across them; weight each tree's
+                    # share by actor_var_tree_weights (inversely proportional
+                    # to that tree's own variance-leaf magnitude, summing to
+                    # 1) rather than a uniform 1/n_est - same rationale as the
+                    # mean update, but computed from the variance leaves
+                    # themselves rather than borrowed from the mean's decay
+                    # pattern. Weights summing to 1 replace the old /n_est.
                     var_step = (lr_scale * self.var_lr
                                 * (self.var_max - self.var_min)
-                                / (self.exploration_factor ** 2 * n_est))
-                    self.actor_leaf_vars += var_step[:, None, None] * u_var
+                                / (self.exploration_factor ** 2))
+                    for d in range(self.action_dim):
+                        self.actor_leaf_vars[d] += (
+                            var_step[d] * self.actor_var_tree_weights[d][:, None]
+                            * u_var[d]
+                        )
             if self.obs_dependent_std:
                 np.clip(self.actor_leaf_vars,
                         self.var_min[:, None, None], self.var_max[:, None, None],
@@ -1035,6 +1096,7 @@ class Hybrid_XGB:
         var_min: float = 1e-3,
         shared_tree_structure: bool = True,
         verify_reconstruction: bool = True,
+        invert_tree_weights: bool = False,
         **kwargs,
     ):
         self.env = env
@@ -1077,6 +1139,7 @@ class Hybrid_XGB:
             target_kl=target_kl,
             shared_tree_structure=shared_tree_structure,
             verify_reconstruction=verify_reconstruction,
+            invert_tree_weights=invert_tree_weights,
         )
 
         try:
@@ -1167,7 +1230,9 @@ class Hybrid_XGB:
         cfg = (f"n_estimators={e.n_estimators} max_depth={e.actor_params['max_depth']} "
                f"gamma={self.gamma} ppo_lr={e.ppo_lr} critic_lr={e.critic_lr} "
                f"exploration_rho={e.exploration_rho} nu={e.exploration_factor:.4f} "
-               f"var_mode={e.var_mode} use_ppo_clip={e.use_ppo_clip} "
+               f"var_mode={e.var_mode} var_update={e.var_update} "
+               f"invert_tree_weights={e.invert_tree_weights} "
+               f"use_ppo_clip={e.use_ppo_clip} "
                f"obs_dependent_std={e.obs_dependent_std} "
                f"awr_target_ess={e.awr_target_ess} awr_update_freq={self.awr_update_freq} "
                f"awr_buffer_size={self.awr_buffer['max_size']} n_steps={self.n_steps} "
@@ -1356,10 +1421,12 @@ class Hybrid_XGB:
             "actor_leaf_means": self.engine.actor_leaf_means,
             "actor_leaf_vars": self.engine.actor_leaf_vars,
             "actor_tree_weights": self.engine.actor_tree_weights,
+            "actor_var_tree_weights": self.engine.actor_var_tree_weights,
             "critic_leaf_means": self.engine.critic_leaf_means,
             "critic_tree_weights": self.engine.critic_tree_weights,
             "n_leaf_slots": self.engine._n_leaf_slots,
             "shared_tree_structure": self.engine.shared_tree_structure,
+            "invert_tree_weights": self.engine.invert_tree_weights,
             "log_std": getattr(self.engine, "log_std", None),
             "num_timesteps": self.num_timesteps,
         }
@@ -1381,10 +1448,23 @@ class Hybrid_XGB:
         self.engine.actor_leaf_means = blob["actor_leaf_means"]
         self.engine.actor_leaf_vars = blob["actor_leaf_vars"]
         self.engine.actor_tree_weights = blob["actor_tree_weights"]
+        # .get() for backward compatibility with checkpoints saved before Fix
+        # 15: fall back to a uniform (summing-to-1) weighting, matching what
+        # the old unconditional-/n_est additive update was equivalent to.
+        if "actor_var_tree_weights" in blob:
+            self.engine.actor_var_tree_weights = blob["actor_var_tree_weights"]
+        else:
+            n_est = self.engine.n_estimators
+            self.engine.actor_var_tree_weights = np.full(
+                self.engine.actor_tree_weights.shape, 1.0 / n_est
+            )
         self.engine.critic_leaf_means = blob["critic_leaf_means"]
         self.engine.critic_tree_weights = blob["critic_tree_weights"]
         self.engine._n_leaf_slots = blob["n_leaf_slots"]
         self.engine.shared_tree_structure = blob["shared_tree_structure"]
+        # .get() for backward compatibility with pre-Fix-15 checkpoints, which
+        # were all computed with the (then-only) inverse-magnitude scheme.
+        self.engine.invert_tree_weights = blob.get("invert_tree_weights", True)
         if blob["log_std"] is not None:
             self.engine.log_std = blob["log_std"]
         self.num_timesteps = blob["num_timesteps"]
