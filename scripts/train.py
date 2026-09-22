@@ -26,9 +26,9 @@ from callback.callbacks import (OffPolicyDistillationCallback,
                                 StopTrainingOnNoImprovementInTraining)
 
 from env.equation import register_equation_tests
-from env.minigrid import register_minigrid_tests
-from env.wrappers import (CategoricalDummyVecEnv,
-                          MiniGridCategoricalObservationWrapper)
+#from env.minigrid import register_minigrid_tests
+from env.wrappers import (CategoricalDummyVecEnv)#,
+                          #MiniGridCategoricalObservationWrapper)
 from utils.helpers import make_ram_atari_env, set_seed
 
 warnings.filterwarnings("ignore")
@@ -44,18 +44,16 @@ from algos.dqn import DQN_GBRL
 from algos.ppo import PPO_GBRL
 from algos.sac import SAC_GBRL
 
-from algos.ppo_xgb import PPO_XGB
-from algos.awr_xgb import AWR_XGB
-from algos.hybrid_gbrl import Hybrid_GBRL
+#from algos.ppo_xgb import PPO_XGB
+#from algos.awr_xgb import AWR_XGB
+#from algos.hybrid_gbrl import Hybrid_GBRL
 from algos.hybrid_xgb import Hybrid_XGB
-from algos.hybrid_rf import Hybrid_RF
+#from algos.hybrid_rf import Hybrid_RF
 
 from config.args import parse_args, process_logging, process_policy_kwargs
 
 NAME_TO_ALGO = {'ppo_gbrl': PPO_GBRL, 'a2c_gbrl': A2C_GBRL, 'sac_gbrl': SAC_GBRL, 'awr_gbrl': AWR_GBRL,
-                'ppo_nn': PPO, 'a2c_nn': A2C, 'dqn_gbrl': DQN_GBRL, 'awr_nn': AWR, 'dqn_nn': DQN,
-                'ppo_xgb': PPO_XGB, 'awr_xgb': AWR_XGB, 'hybrid_gbrl': Hybrid_GBRL, 'hybrid_xgb': Hybrid_XGB,
-                'hybrid_rf': Hybrid_RF}
+                'ppo_nn': PPO, 'a2c_nn': A2C, 'dqn_gbrl': DQN_GBRL, 'awr_nn': AWR, 'dqn_nn': DQN, 'hybrid_xgb': Hybrid_XGB}
 
 CATEGORICAL_ALGOS = [algo for algo in NAME_TO_ALGO if 'gbrl' in algo or 'xgb' in algo]
 ON_POLICY_ALGOS = ['ppo_gbrl', 'a2c_gbrl', 'ppo_xgb']

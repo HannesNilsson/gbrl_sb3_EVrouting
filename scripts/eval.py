@@ -1,160 +1,125 @@
-##############################################################################
-# Copyright (c) 2024, NVIDIA Corporation. All rights reserved.
-#
-# This work is made available under the Nvidia Source Code License-NC.
-# To view a copy of this license, visit
-# https://nvlabs.github.io/gbrl_sb3/license.html
-#
-##############################################################################
-import argparse
-import glob
-import os
-import sys
-from pathlib import Path
+"""Year-round evaluation for EVCorridorEnv.
+
+EVCorridorEnv's clock (`global_hour`) is never reset between episodes, so
+ambient temperature - and with it energy consumption - follows the calendar.
+An evaluation env built fresh starts on 1 January, and a block of consecutive
+evaluation episodes only covers the first few months: mostly winter, the
+expensive end of the year.
+
+This module evaluates on a fixed, calendar-stratified set of start times
+instead: the same number of episodes starting in each month, spread evenly
+within the month and across the years of the temperature record, each episode
+reset with its own fixed seed.  Every agent is evaluated on exactly the same
+(start hour, seed) pairs, so differences between agents are not diluted by
+seasonal sampling noise (common random numbers).
+
+    from ev_year_eval import evaluate_year_round, summarise
+    per_episode = evaluate_year_round(model, env_kwargs, episodes_per_month=10)
+    stats = summarise(per_episode)      # annual mean + per-month + seasons
+"""
+
+from __future__ import annotations
 
 import numpy as np
 
-ROOT_PATH = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT_PATH))
+from env.EVCorridorEnv import make_nn_env
 
-import warnings
+HOURS_PER_YEAR = 8760.0
+HOURS_PER_MONTH = HOURS_PER_YEAR / 12.0
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+SEASONS = {"winter": (11, 0, 1), "spring": (2, 3, 4),
+           "summer": (5, 6, 7), "autumn": (8, 9, 10)}
 
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import (DummyVecEnv, VecFrameStack,
-                                              VecNormalize, VecVideoRecorder)
+# Fixed seed block for evaluation episodes: disjoint from training
+# (seed .. seed + n_envs), the per-stage evaluation env (seed + 10_000), and
+# identical for every agent and every training seed.
+EVAL_SEED_BASE = 900_000
 
-from env.minigrid import register_minigrid_tests
-from env.wrappers import (CategoricalDummyVecEnv,
-                          MiniGridCategoricalObservationWrapper)
-from utils.helpers import make_ram_atari_env
 
-warnings.filterwarnings("ignore")
+def _n_years(env) -> int:
+    temps = getattr(env.unwrapped, "historical_temps", None)
+    if temps is None or len(temps) < HOURS_PER_YEAR:
+        return 1
+    return max(1, int(len(temps) // HOURS_PER_YEAR))
 
-from stable_baselines3.a2c.a2c import A2C
-from stable_baselines3.dqn.dqn import DQN
-from stable_baselines3.ppo.ppo import PPO
 
-from algos.a2c import A2C_GBRL
-from algos.awr import AWR_GBRL
-from algos.awr_nn import AWR
-from algos.dqn import DQN_GBRL
-from algos.ppo import PPO_GBRL
-from algos.sac import SAC_GBRL
-from config.args import json_string_to_dict
+def schedule(episodes_per_month: int, n_years: int):
+    """(month, start_hour, seed) for every evaluation episode, deterministic."""
+    out = []
+    for m in range(12):
+        for j in range(episodes_per_month):
+            year = j % n_years
+            within = (j + 0.5) / episodes_per_month * HOURS_PER_MONTH
+            start = year * HOURS_PER_YEAR + m * HOURS_PER_MONTH + within
+            out.append((m, float(start), EVAL_SEED_BASE + m * 1000 + j))
+    return out
 
-NAME_TO_ALGO = {'ppo_gbrl': PPO_GBRL, 'a2c_gbrl': A2C_GBRL, 'sac_gbrl': SAC_GBRL,
-                'awr_gbrl': AWR_GBRL, 'ppo_nn': PPO, 'a2c_nn': A2C, 'dqn_gbrl': DQN_GBRL,
-                'awr_nn': AWR, 'dqn_nn': DQN}
-CATEGORICAL_ALGOS = [algo for algo in NAME_TO_ALGO if 'gbrl' in algo]
-ON_POLICY_ALGOS = ['ppo_gbrl', 'a2c_gbrl']
-OFF_POLICY_ALGOS = ['sac_gbrl', 'dqn_gbrl', 'awr_gbrl']
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--env_type', type=str, choices=['atari', 'ocatari', 'minigrid', 'gym', 'mujoco', 'football'])
-    parser.add_argument('--algo_type', type=str, choices=['ppo_nn', 'ppo_gbrl', 'a2c_gbrl', 'sac_gbrl', 'awr_gbrl',
-                                                          'dqn_gbrl', 'a2c_nn', 'awr_nn', 'dqn_nn'])
-    parser.add_argument('--env_name', type=str)
-    parser.add_argument('--folder_path', type=str, default=str(ROOT_PATH / 'saved_models'))
-    # env args
-    parser.add_argument('--device', type=str, choices=['cpu', 'cuda'], default='cuda')
-    parser.add_argument('--model_name', type=str)
-    parser.add_argument('--checkpoint', type=str)
-    parser.add_argument('--n_eval_episodes', type=int, default=50)
-    parser.add_argument('--video_length', type=int, default=2000)
-    parser.add_argument('--atari_wrapper_kwargs', type=json_string_to_dict)
-    parser.add_argument('--env_kwargs', type=json_string_to_dict)
-    parser.add_argument('--last_checkpoint', action="store_true")
-    parser.add_argument('--record', action="store_true")
-    parser.add_argument('--render', action="store_true")
-    parser.add_argument('--eval_env_name', type=str)
-    parser.add_argument('--prefix', type=str, default='eval')
-    parser.add_argument('--deterministic', action="store_true")
-    args = parser.parse_args()
+def _profit(info) -> float:
+    return (float(info.get("revenue", 0.0))
+            - float(info.get("electricity_cost", 0.0))
+            - float(info.get("driver_cost", 0.0))
+            - float(info.get("battery_cost", 0.0)))
 
-    if args.eval_env_name is None:
-        args.eval_env_name = args.env_name
 
-    model_fullname = args.model_name
-    save_path = os.path.join(args.folder_path, args.env_type, args.env_name, args.algo_type)
-    if args.checkpoint:
-        model_fullname = args.model_name + "_" + args.checkpoint + "_steps"
-        model_path = os.path.join(save_path, model_fullname)
+def evaluate_year_round(model, env_kwargs, episodes_per_month: int = 10,
+                        deterministic: bool = True):
+    """Run the stratified evaluation; returns one dict per episode.
 
-    if args.last_checkpoint:
-        checkpoints = glob.glob(os.path.join(save_path, f"{args.model_name}_*_steps.zip"))
-        if len(checkpoints) == 0:
-            raise ValueError(f"No checkpoint found for {args.algo_type} on {args.env_type}, path: {save_path}")
+    Uses a plain (non-vectorised) env so the clock can be set *before* each
+    reset: reset() reads temperature and electricity price at the current
+    clock, and a VecEnv resets automatically inside step(), too late to move
+    the clock first.  Observations are batched to shape (1, obs_dim), the same
+    shape a single-env VecEnv hands the model, so SB3 and Hybrid_XGB both
+    accept them unchanged.
+    """
+    # A fixed construction seed.  When the chargers CSV has no price column,
+    # EVCorridorEnv draws every station's base electricity price at
+    # construction from default_rng(seed) - and seed defaults to None, so each
+    # new env gets a different price map.  Without this, the same model scores
+    # differently on every evaluation and agents are compared on different
+    # prices.  Pinning it gives every agent the same corridor.
+    kwargs = dict(env_kwargs)
+    kwargs.setdefault("seed", EVAL_SEED_BASE)
+    env = make_nn_env(**kwargs)
+    base = env.unwrapped
+    rows = []
+    for month, start, seed in schedule(episodes_per_month, _n_years(env)):
+        base.global_hour = start
+        obs, _ = env.reset(seed=seed)
+        ret, profit, done, info = 0.0, 0.0, False, {}
+        state, first = None, True
+        while not done:
+            out = model.predict(obs[None], state=state,
+                                episode_start=np.array([first]),
+                                deterministic=deterministic)
+            action, state = out if isinstance(out, tuple) else (out, None)
+            action = np.asarray(action).reshape(-1)
+            obs, r, term, trunc, info = env.step(action)
+            ret += float(r)
+            profit += _profit(info)
+            done, first = term or trunc, False
+        rows.append({"month": month, "start_hour": start, "seed": seed,
+                     "return": ret, "profit_eur": profit,
+                     "completed": bool(info.get("mission_complete", False)),
+                     "failed": bool(info.get("fail", False))})
+    return rows
 
-        def step_count(checkpoint_path: str) -> int:
-            # path follow the pattern "*_steps.zip", we count from the back to ignore any other _ in the path
-            return int(checkpoint_path.split("_")[-2])
-        model_fullname = args.model_name + "_final_checkpoint"
-        checkpoints = sorted(checkpoints, key=step_count)
-        model_path = checkpoints[-1]
-    model_underscores = model_path.split("_")
-    vecnormalize_path = "_".join(model_underscores[:-2] + ['vecnormalize'] + model_underscores[-2:])
-    vecnormalize_path = vecnormalize_path.replace(".zip", ".pkl")
 
-    eval_env = None
-    if 'atari' in args.env_type:
-        env_kwargs = {'full_action_space': False}
-        vec_env_cls = None
-        vec_env_kwargs = None
-        eval_env = make_ram_atari_env(args.eval_env_name, n_envs=1, wrapper_kwargs=args.atari_wrapper_kwargs,
-                                      env_kwargs=env_kwargs, vec_env_cls=vec_env_cls, vec_env_kwargs=vec_env_kwargs)
+def summarise(rows):
+    """Annual, per-season and per-month means from evaluate_year_round rows."""
+    def agg(sub):
+        if not sub:
+            return None
+        return {"return": float(np.mean([r["return"] for r in sub])),
+                "profit_eur": float(np.mean([r["profit_eur"] for r in sub])),
+                "completion_rate": float(np.mean([r["completed"] for r in sub])),
+                "n": len(sub)}
 
-        if args.atari_wrapper_kwargs and 'frame_stack' in args.atari_wrapper_kwargs:
-            eval_env = VecFrameStack(eval_env, n_stack=args.atari_wrapper_kwargs['frame_stack'])
-    elif args.env_type == 'minigrid':
-        from minigrid.wrappers import FlatObsWrapper
-        register_minigrid_tests()
-        wrapper_class = MiniGridCategoricalObservationWrapper if args.algo_type in CATEGORICAL_ALGOS else FlatObsWrapper
-        vec_env_cls = CategoricalDummyVecEnv if args.algo_type in CATEGORICAL_ALGOS else DummyVecEnv
-        eval_env = make_vec_env(args.eval_env_name, n_envs=1, env_kwargs=args.env_kwargs, wrapper_class=wrapper_class,
-                                vec_env_cls=vec_env_cls)
-    elif args.env_type == 'football':
-        try:
-            from env.football import FootballGymSB3
-        except ModuleNotFoundError:
-            print("Could not find gfootball! please run pip install gfootball")
-        if args.env_kwargs is None:
-            args.env_kwargs = {}
-        args.env_kwargs['env_name'] = args.eval_env_name
-        eval_env = make_vec_env(FootballGymSB3, n_envs=1, env_kwargs=args.env_kwargs)
-    elif args.env_type == 'mujoco' or args.env_type == 'gym':
-        eval_env = make_vec_env(args.eval_env_name, n_envs=1, env_kwargs=args.env_kwargs)
-    else:
-        print("Invalid env_type!")
-
-    if os.path.exists(vecnormalize_path):
-        eval_env = VecNormalize.load(vecnormalize_path, eval_env)
-        eval_env.training = False
-
-    if args.record:
-        video_path = ROOT_PATH / f'videos/{args.env_type}/{args.env_name}/{args.algo_type}'
-        if not os.path.exists(video_path):
-            os.makedirs(video_path, exist_ok=True)
-        eval_env = VecVideoRecorder(eval_env, video_folder=video_path, record_video_trigger=lambda x: x == 0,
-                                    name_prefix=f'{args.prefix}_{model_fullname}', video_length=args.video_length)
-
-    # set_seed(args.seed)
-    algo = NAME_TO_ALGO[args.algo_type].load(
-        path=model_path,
-        env=eval_env,
-        device=args.device,
-        force_reset=True)
-
-    episode_rewards, episode_lengths = evaluate_policy(
-        algo,
-        eval_env,
-        n_eval_episodes=args.n_eval_episodes,
-        render=args.render,
-        deterministic=args.deterministic,
-        return_episode_rewards=True,
-    )
-    mean_reward, std_reward = np.mean(episode_rewards), np.std(episode_rewards)
-    mean_length, std_length = np.mean(episode_lengths), np.std(episode_lengths)
-    print(f'Evaluation results over {args.n_eval_episodes} - EP reward: {mean_reward:.2f} ' + u"\u00B1" +
-          f' {std_reward:.2f} EP length: {mean_length:.2f} ' + u"\u00B1" + f' {std_length:.2f}')
+    out = {"annual": agg(rows)}
+    for name, months in SEASONS.items():
+        out[name] = agg([r for r in rows if r["month"] in months])
+    out["monthly"] = {MONTHS[m]: agg([r for r in rows if r["month"] == m])
+                      for m in range(12)}
+    return out

@@ -12,8 +12,8 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 from gbrl.common.utils import categorical_dtype
-from minigrid.core.constants import IDX_TO_COLOR, IDX_TO_OBJECT, STATE_TO_IDX
-from minigrid.wrappers import FullyObsWrapper, ObservationWrapper
+#from minigrid.core.constants import IDX_TO_COLOR, IDX_TO_OBJECT, STATE_TO_IDX
+#from minigrid.wrappers import FullyObsWrapper, ObservationWrapper
 from stable_baselines3.common.atari_wrappers import (ClipRewardEnv,
                                                      EpisodicLifeEnv,
                                                      FireResetEnv,
@@ -39,10 +39,10 @@ def save_rendered_frame(env, frame_number=None):
     plt.close()
 
 
-IDX_TO_STATE = {v: k for k, v in STATE_TO_IDX.items()}
+#IDX_TO_STATE = {v: k for k, v in STATE_TO_IDX.items()}
 MAX_TEXT_LENGTH = 128 - 1
 
-
+'''
 class MiniGridCategoricalObservationWrapper(ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -108,7 +108,7 @@ class MiniGridIndexCategoricalObservationWrapper(ObservationWrapper):
     def reset(self, seed: int = None):
         observation, info = self.env.reset(seed=seed)
         return self.observation(observation), info
-
+'''
 
 class CategoricalDummyVecEnv(DummyVecEnv):
     """
